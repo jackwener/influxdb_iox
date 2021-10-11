@@ -16,31 +16,34 @@
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use data_types::{
-    detailed_database::{DetailedDatabase, GenerationId},
-    error::ErrorLogger,
-    server_id::ServerId,
-    DatabaseName,
-};
+use data_types::{error::ErrorLogger, server_id::ServerId};
 use futures::{stream::BoxStream, StreamExt, TryStreamExt};
 use object_store::{
-    path::{parsed::DirsAndFileName, ObjectStorePath, Path},
+    path::{parsed::DirsAndFileName, Path},
     ObjectStore, ObjectStoreApi, Result,
 };
 use observability_deps::tracing::warn;
-use snafu::{ensure, OptionExt, ResultExt, Snafu};
-use std::{collections::BTreeMap, sync::Arc};
+use snafu::{ensure, ResultExt, Snafu};
+use std::{str::FromStr, sync::Arc};
 use tokio::sync::mpsc::channel;
 use tokio_stream::wrappers::ReceiverStream;
+use uuid::Uuid;
 
 mod paths;
 pub use paths::{
     parquet_file::{ParquetFilePath, ParquetFilePathParseError},
     transaction_file::TransactionFilePath,
 };
-use paths::{DataPath, GenerationPath, RootPath, TombstonePath, TransactionsPath};
+use paths::{DataPath, RootPath, TombstonePath, TransactionsPath};
 
-const DB_RULES_FILE_NAME: &str = "rules.pb";
+/// Detailed metadata about a database.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DatabaseMetadata {
+    /// The UUID of the database
+    pub uuid: Uuid,
+    /// The UTC datetime at which this database was deleted, if applicable
+    pub deleted_at: Option<DateTime<Utc>>,
+}
 
 #[derive(Debug, Snafu)]
 #[allow(missing_docs)]
@@ -48,30 +51,18 @@ pub enum IoxObjectStoreError {
     #[snafu(display("{}", source))]
     UnderlyingObjectStoreError { source: object_store::Error },
 
-    #[snafu(display("Cannot create database `{}`; it already exists", name,))]
-    DatabaseAlreadyExists { name: String },
-
-    #[snafu(display("Multiple active databases found in object storage"))]
-    MultipleActiveDatabasesFound,
-
-    #[snafu(display("Cannot restore; there is already an active database named `{}`", name))]
-    ActiveDatabaseAlreadyExists { name: String },
-
-    #[snafu(display("Generation `{}` not found for database `{}`", generation_id, name))]
-    GenerationNotFound {
-        generation_id: GenerationId,
-        name: String,
-    },
+    #[snafu(display("Cannot create database with UUID `{}`; it already exists", uuid))]
+    DatabaseAlreadyExists { uuid: Uuid },
 
     #[snafu(display(
-        "Could not restore generation `{}` of database `{}`: {}",
-        generation_id,
-        name,
-        source
+        "Cannot restore; there is already an active database with UUID `{}`",
+        uuid
     ))]
+    ActiveDatabaseAlreadyExists { uuid: Uuid },
+
+    #[snafu(display("Could not restore database with UUID `{}`: {}", uuid, source))]
     RestoreFailed {
-        generation_id: GenerationId,
-        name: String,
+        uuid: Uuid,
         source: object_store::Error,
     },
 }
@@ -83,30 +74,11 @@ pub enum IoxObjectStoreError {
 pub struct IoxObjectStore {
     inner: Arc<ObjectStore>,
     server_id: ServerId,
-    database_name: DatabaseName<'static>,
-    generation_path: GenerationPath,
+    uuid: Uuid,
+    root_path: RootPath,
+    tombstone_path: TombstonePath,
     data_path: DataPath,
     transactions_path: TransactionsPath,
-}
-
-/// Private information about a database's generation.
-#[derive(Debug, Copy, Clone, PartialEq)]
-struct Generation {
-    id: GenerationId,
-    deleted_at: Option<DateTime<Utc>>,
-}
-
-impl Generation {
-    fn active(id: usize) -> Self {
-        Self {
-            id: GenerationId { inner: id },
-            deleted_at: None,
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        self.deleted_at.is_none()
-    }
 }
 
 impl IoxObjectStore {
@@ -115,7 +87,7 @@ impl IoxObjectStore {
     pub async fn list_possible_databases(
         inner: &ObjectStore,
         server_id: ServerId,
-    ) -> Result<Vec<DatabaseName<'static>>> {
+    ) -> Result<Vec<Uuid>> {
         let path = paths::all_databases_path(inner, server_id);
 
         let list_result = inner.list_with_delimiter(&path).await?;
@@ -129,11 +101,11 @@ impl IoxObjectStore {
                     .directories
                     .last()
                     .expect("path can't be empty");
-                let db_name = DatabaseName::new(last.encoded().to_string())
+                let uuid = Uuid::from_str(&last.encoded().to_string())
                     .log_if_error("invalid database directory")
                     .ok()?;
 
-                Some(db_name)
+                Some(uuid)
             })
             .collect())
     }
@@ -144,61 +116,25 @@ impl IoxObjectStore {
     pub async fn list_deleted_databases(
         inner: &ObjectStore,
         server_id: ServerId,
-    ) -> Result<Vec<DetailedDatabase>> {
-        Ok(Self::list_all_databases(inner, server_id)
+    ) -> Result<Vec<DatabaseMetadata>> {
+        Ok(Self::list_detailed_databases(inner, server_id)
             .await?
             .into_iter()
-            .flat_map(|(name, generations)| {
-                let name = Arc::new(name);
-                generations.into_iter().filter_map(move |gen| {
-                    let name = Arc::clone(&name);
-                    gen.deleted_at.map(|_| DetailedDatabase {
-                        name: (*name).clone(),
-                        generation_id: gen.id,
-                        deleted_at: gen.deleted_at,
-                    })
-                })
-            })
+            .filter(|detailed_database| detailed_database.deleted_at.is_some())
             .collect())
     }
 
-    /// List all databases in in object storage along with their generation IDs and if/when they
-    /// were deleted. Useful for visibility into object storage and finding databases to restore or
-    /// permanently delete.
+    /// List all databases in in object storage along with if/when they were deleted. Useful for
+    /// visibility into object storage and finding databases to restore or permanently delete.
     pub async fn list_detailed_databases(
         inner: &ObjectStore,
         server_id: ServerId,
-    ) -> Result<Vec<DetailedDatabase>> {
-        Ok(Self::list_all_databases(inner, server_id)
-            .await?
-            .into_iter()
-            .flat_map(|(name, generations)| {
-                let name = Arc::new(name);
-                generations.into_iter().map(move |gen| {
-                    let name = Arc::clone(&name);
-                    DetailedDatabase {
-                        name: (*name).clone(),
-                        generation_id: gen.id,
-                        deleted_at: gen.deleted_at,
-                    }
-                })
-            })
-            .collect())
-    }
-
-    /// List database names in object storage along with all existing generations for each database
-    /// and whether the generations are marked as deleted or not. Useful for finding candidates
-    /// to restore or to permanently delete. Makes many more calls to object storage than
-    /// [`IoxObjectStore::list_possible_databases`].
-    async fn list_all_databases(
-        inner: &ObjectStore,
-        server_id: ServerId,
-    ) -> Result<BTreeMap<DatabaseName<'static>, Vec<Generation>>> {
+    ) -> Result<Vec<DatabaseMetadata>> {
         let path = paths::all_databases_path(inner, server_id);
 
         let list_result = inner.list_with_delimiter(&path).await?;
 
-        let mut all_dbs = BTreeMap::new();
+        let mut all_dbs = Vec::new();
 
         for prefix in list_result.common_prefixes {
             let prefix_parsed: DirsAndFileName = prefix.into();
@@ -207,132 +143,96 @@ impl IoxObjectStore {
                 .last()
                 .expect("path can't be empty");
 
-            if let Ok(db_name) = DatabaseName::new(last.encoded().to_string())
+            if let Ok(uuid) = Uuid::from_str(&last.encoded().to_string())
                 .log_if_error("invalid database directory")
             {
-                let root_path = RootPath::new(inner, server_id, &db_name);
-                let generations = Self::list_generations(inner, &root_path).await?;
+                let root_path = RootPath::new(inner, server_id, uuid);
+                let deleted_at = Self::check_deleted(inner, &root_path).await?;
 
-                all_dbs.insert(db_name, generations);
+                all_dbs.push(DatabaseMetadata { uuid, deleted_at });
             }
         }
 
         Ok(all_dbs)
     }
 
-    // Private function to list all generation directories in object storage for a particular
-    // database.
-    async fn list_generations(
+    // Private function to check if a given database has been deleted or not. If the database is
+    // active, this returns `None`. If the database has been deleted, this returns
+    // `Some(deleted_at)` where `deleted_at` is the time at which the database was deleted.
+    async fn check_deleted(
         inner: &ObjectStore,
         root_path: &RootPath,
-    ) -> Result<Vec<Generation>> {
+    ) -> Result<Option<DateTime<Utc>>> {
         let list_result = inner.list_with_delimiter(&root_path.inner).await?;
 
-        let mut generations = Vec::with_capacity(list_result.common_prefixes.len());
+        let tombstone_file = root_path.tombstone_path();
+        let deleted_at = list_result
+            .objects
+            .into_iter()
+            .find(|object| object.location == tombstone_file.inner)
+            .map(|object| object.last_modified);
 
-        for prefix in list_result.common_prefixes {
-            let prefix_parsed: DirsAndFileName = prefix.clone().into();
-            let id = prefix_parsed
-                .directories
-                .last()
-                .expect("path can't be empty");
-
-            if let Ok(id) = id.to_string().parse() {
-                // If we can't list the contents of a database directory, we can't
-                // know if it's deleted or not, so this should be an error.
-                let generation_list_result = inner.list_with_delimiter(&prefix).await?;
-                let tombstone_file = TombstonePath::new_from_object_store_path(&prefix);
-
-                let deleted_at = generation_list_result
-                    .objects
-                    .into_iter()
-                    .find(|object| object.location == tombstone_file.inner)
-                    .map(|object| object.last_modified);
-
-                generations.push(Generation { id, deleted_at });
-            } else {
-                // Deliberately ignoring errors with parsing; if the directory isn't a usize, it's
-                // not a valid database generation directory and we should skip it.
-                warn!("invalid generation directory found: {}", id);
-            }
-        }
-
-        Ok(generations)
+        Ok(deleted_at)
     }
 
     /// Create a database-specific wrapper. Takes all the information needed to create a new
-    /// root directory of a database. Checks that there isn't already an active database
-    /// with this name in object storage.
+    /// root directory of a database. Checks that there isn't already anything under this UUID in
+    /// object storage.
     ///
     /// Caller *MUST* ensure there is at most 1 concurrent call of this function with the same
     /// parameters; this function does *NOT* do any locking.
     pub async fn new(
         inner: Arc<ObjectStore>,
         server_id: ServerId,
-        database_name: &DatabaseName<'static>,
+        uuid: Uuid,
     ) -> Result<Self, IoxObjectStoreError> {
-        let root_path = RootPath::new(&inner, server_id, database_name);
-
-        let generations = Self::list_generations(&inner, &root_path)
+        let root_path = RootPath::new(&inner, server_id, uuid);
+        let list_result = inner
+            .list_with_delimiter(&root_path.inner)
             .await
             .context(UnderlyingObjectStoreError)?;
 
-        let active = generations.iter().find(|g| g.is_active());
-
         ensure!(
-            active.is_none(),
-            DatabaseAlreadyExists {
-                name: database_name
-            }
+            list_result.objects.is_empty(),
+            DatabaseAlreadyExists { uuid }
         );
 
-        let next_generation_id = generations
-            .iter()
-            .max_by_key(|g| g.id)
-            .map(|max| max.id.inner + 1)
-            .unwrap_or(0);
-
-        Ok(Self::existing(
-            inner,
-            server_id,
-            database_name,
-            Generation::active(next_generation_id),
-            root_path,
-        ))
+        Ok(Self::existing(inner, server_id, uuid, root_path))
     }
 
-    /// Look in object storage for an existing database with this name and a non-deleted
-    /// generation, and error if none is found.
+    /// Look in object storage for an existing, active database with this UUID.
     pub async fn find_existing(
         inner: Arc<ObjectStore>,
         server_id: ServerId,
-        database_name: &DatabaseName<'static>,
+        uuid: Uuid,
     ) -> Result<Option<Self>, IoxObjectStoreError> {
-        let root_path = RootPath::new(&inner, server_id, database_name);
-
-        let generations = Self::list_generations(&inner, &root_path)
+        let root_path = RootPath::new(&inner, server_id, uuid);
+        let list_result = inner
+            .list_with_delimiter(&root_path.inner)
             .await
             .context(UnderlyingObjectStoreError)?;
 
-        let mut active_generations = generations.iter().filter(|g| g.is_active());
+        let rules_file = root_path.rules_path();
+        let rules = list_result
+            .objects
+            .iter()
+            .find(|object| object.location == rules_file.inner);
 
-        let active = match active_generations.next() {
-            Some(a) => *a,
-            None => return Ok(None),
-        };
+        if rules.is_none() {
+            return Ok(None);
+        }
 
-        ensure!(
-            active_generations.next().is_none(),
-            MultipleActiveDatabasesFound
-        );
+        let tombstone_file = root_path.tombstone_path();
+        let tombstone = list_result
+            .objects
+            .iter()
+            .find(|object| object.location == tombstone_file.inner);
 
-        Ok(Some(Self::existing(
-            inner,
-            server_id,
-            database_name,
-            active,
-            root_path,
-        )))
+        if tombstone.is_some() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self::existing(inner, server_id, uuid, root_path)))
     }
 
     /// Access the database-specific object storage files for an existing database that has
@@ -340,35 +240,40 @@ impl IoxObjectStore {
     fn existing(
         inner: Arc<ObjectStore>,
         server_id: ServerId,
-        database_name: &DatabaseName<'static>,
-        generation: Generation,
+        uuid: Uuid,
         root_path: RootPath,
     ) -> Self {
-        let generation_path = root_path.generation_path(generation);
-        let data_path = generation_path.data_path();
-        let transactions_path = generation_path.transactions_path();
+        let tombstone_path = root_path.tombstone_path();
+        let data_path = root_path.data_path();
+        let transactions_path = root_path.transactions_path();
 
         Self {
             inner,
             server_id,
-            database_name: database_name.to_owned(),
-            generation_path,
+            uuid,
+            root_path,
+            tombstone_path,
             data_path,
             transactions_path,
         }
     }
 
+    /// The UUID of the database this object store is for.
+    pub fn uuid(&self) -> Uuid {
+        self.uuid
+    }
+
     /// The location in object storage for all files for this database, suitable for logging
     /// or debugging purposes only. Do not parse this, as its format is subject to change!
     pub fn debug_database_path(&self) -> String {
-        self.generation_path.inner.to_string()
+        self.root_path.inner.to_string()
     }
 
     // Deliberately private; this should not leak outside this crate
     // so assumptions about the object store organization are confined
     // (and can be changed) in this crate
     fn tombstone_path(&self) -> Path {
-        TombstonePath::new(&self.generation_path).inner
+        self.root_path.tombstone_path().inner
     }
 
     /// Write the file in the database directory that indicates this database is marked as deleted,
@@ -383,50 +288,24 @@ impl IoxObjectStore {
     pub async fn restore_database(
         inner: Arc<ObjectStore>,
         server_id: ServerId,
-        database_name: &DatabaseName<'static>,
-        generation_id: GenerationId,
+        uuid: Uuid,
     ) -> Result<Self, IoxObjectStoreError> {
-        let root_path = RootPath::new(&inner, server_id, database_name);
+        let root_path = RootPath::new(&inner, server_id, uuid);
 
-        let generations = Self::list_generations(&inner, &root_path)
+        let deleted_at = Self::check_deleted(&inner, &root_path)
             .await
             .context(UnderlyingObjectStoreError)?;
 
-        let active = generations.iter().find(|g| g.is_active());
+        ensure!(deleted_at.is_some(), ActiveDatabaseAlreadyExists { uuid });
 
-        ensure!(
-            active.is_none(),
-            ActiveDatabaseAlreadyExists {
-                name: database_name
-            }
-        );
-
-        let restore_candidate = generations
-            .iter()
-            .find(|g| g.id == generation_id && !g.is_active())
-            .context(GenerationNotFound {
-                generation_id,
-                name: database_name.as_str(),
-            })?;
-
-        let generation_path = root_path.generation_path(*restore_candidate);
-        let tombstone_path = TombstonePath::new(&generation_path);
+        let tombstone_path = root_path.tombstone_path();
 
         inner
             .delete(&tombstone_path.inner)
             .await
-            .context(RestoreFailed {
-                generation_id,
-                name: database_name.as_str(),
-            })?;
+            .context(RestoreFailed { uuid })?;
 
-        Ok(Self::existing(
-            inner,
-            server_id,
-            database_name,
-            Generation::active(generation_id.inner),
-            root_path,
-        ))
+        Ok(Self::existing(inner, server_id, uuid, root_path))
     }
 
     // Catalog transaction file methods ===========================================================
@@ -540,9 +419,7 @@ impl IoxObjectStore {
     // so assumptions about the object store organization are confined
     // (and can be changed) in this crate
     fn db_rules_path(&self) -> Path {
-        let mut path = self.generation_path.inner.clone();
-        path.set_file_name(DB_RULES_FILE_NAME);
-        path
+        self.root_path.rules_path().inner
     }
 
     /// Get the data for the database rules
@@ -650,14 +527,14 @@ mod tests {
         let server_id = make_server_id();
         let server_id_string = server_id.to_string();
         let server_id_str = server_id_string.as_str();
-        let database_name = DatabaseName::new("clouds").unwrap();
-        let database_name_str = database_name.as_str();
-        let iox_object_store =
-            IoxObjectStore::new(Arc::clone(&object_store), server_id, &database_name)
-                .await
-                .unwrap();
         let uuid = Uuid::new_v4();
-        let good_filename = format!("111.{}.parquet", uuid);
+        let uuid_string = uuid.to_string();
+        let uuid_str = uuid_string.as_str();
+        let iox_object_store = IoxObjectStore::new(Arc::clone(&object_store), server_id, uuid)
+            .await
+            .unwrap();
+        let parquet_uuid = Uuid::new_v4();
+        let good_filename = format!("111.{}.parquet", parquet_uuid);
         let good_filename_str = good_filename.as_str();
 
         // Put a non-database file in
@@ -669,31 +546,25 @@ mod tests {
         add_file(&object_store, &path).await;
 
         // Put a file for some other database in
-        let path =
-            object_store.path_from_dirs_and_filename(parsed_path!([server_id_str, "thunder"]));
+        let other_db_uuid = Uuid::new_v4().to_string();
+        let path = object_store
+            .path_from_dirs_and_filename(parsed_path!([server_id_str, other_db_uuid.as_str()]));
         add_file(&object_store, &path).await;
 
-        // Put a file in the database dir but not the generation dir
+        // Put a file in the database dir but not the data dir
         let path = object_store.path_from_dirs_and_filename(parsed_path!(
-            [server_id_str, database_name_str],
-            good_filename_str
-        ));
-        add_file(&object_store, &path).await;
-
-        // Put a file in the generation dir but not the data dir
-        let path = object_store.path_from_dirs_and_filename(parsed_path!(
-            [server_id_str, database_name_str, "0"],
+            [server_id_str, uuid_str],
             good_filename_str
         ));
         add_file(&object_store, &path).await;
 
         // Put files in the data dir whose names are in the wrong format
         let mut path = object_store.path_from_dirs_and_filename(parsed_path!(
-            [server_id_str, database_name_str, "0", "data"],
+            [server_id_str, uuid_str, "data"],
             "111.parquet"
         ));
         add_file(&object_store, &path).await;
-        path.set_file_name(&format!("111.{}.xls", uuid));
+        path.set_file_name(&format!("111.{}.xls", parquet_uuid));
         add_file(&object_store, &path).await;
 
         // Parquet files should be empty
@@ -748,14 +619,14 @@ mod tests {
         let server_id = make_server_id();
         let server_id_string = server_id.to_string();
         let server_id_str = server_id_string.as_str();
-        let database_name = DatabaseName::new("clouds").unwrap();
-        let database_name_str = database_name.as_str();
-        let iox_object_store =
-            IoxObjectStore::new(Arc::clone(&object_store), server_id, &database_name)
-                .await
-                .unwrap();
         let uuid = Uuid::new_v4();
-        let good_txn_filename = format!("{}.txn", uuid);
+        let uuid_string = uuid.to_string();
+        let uuid_str = uuid_string.as_str();
+        let iox_object_store = IoxObjectStore::new(Arc::clone(&object_store), server_id, uuid)
+            .await
+            .unwrap();
+        let txn_uuid = Uuid::new_v4();
+        let good_txn_filename = format!("{}.txn", txn_uuid);
         let good_txn_filename_str = good_txn_filename.as_str();
 
         // Put a non-database file in
@@ -767,31 +638,23 @@ mod tests {
         add_file(&object_store, &path).await;
 
         // Put a file for some other database in
-        let path =
-            object_store.path_from_dirs_and_filename(parsed_path!([server_id_str, "thunder"]));
+        let other_db_uuid = Uuid::new_v4().to_string();
+        let path = object_store
+            .path_from_dirs_and_filename(parsed_path!([server_id_str, other_db_uuid.as_str()]));
         add_file(&object_store, &path).await;
 
-        // Put a file in the database dir but not the generation dir
+        // Put a file in the database dir but not the transactions dir
         let path = object_store.path_from_dirs_and_filename(parsed_path!(
-            [server_id_str, database_name_str],
-            good_txn_filename_str
-        ));
-        add_file(&object_store, &path).await;
-
-        // Put a file in the generation dir but not the transactions dir
-        let path = object_store.path_from_dirs_and_filename(parsed_path!(
-            [server_id_str, database_name_str, "0"],
+            [server_id_str, uuid_str],
             good_txn_filename_str
         ));
         add_file(&object_store, &path).await;
 
         // Put files in the transactions dir whose names are in the wrong format
-        let mut path = object_store.path_from_dirs_and_filename(parsed_path!(
-            [server_id_str, database_name_str, "0"],
-            "111.parquet"
-        ));
+        let mut path = object_store
+            .path_from_dirs_and_filename(parsed_path!([server_id_str, uuid_str], "111.parquet"));
         add_file(&object_store, &path).await;
-        path.set_file_name(&format!("{}.xls", uuid));
+        path.set_file_name(&format!("{}.xls", txn_uuid));
         add_file(&object_store, &path).await;
 
         // Catalog transaction files should be empty
@@ -799,10 +662,10 @@ mod tests {
         assert!(ctf.is_empty(), "{:?}", ctf);
 
         // Add a real transaction file
-        let t1 = TransactionFilePath::new_transaction(123, uuid);
+        let t1 = TransactionFilePath::new_transaction(123, txn_uuid);
         add_catalog_transaction_file(&iox_object_store, &t1).await;
         // Add a real checkpoint file
-        let t2 = TransactionFilePath::new_checkpoint(123, uuid);
+        let t2 = TransactionFilePath::new_checkpoint(123, txn_uuid);
         add_catalog_transaction_file(&iox_object_store, &t2).await;
 
         // Only the real files should be returned
@@ -812,9 +675,9 @@ mod tests {
         assert!(ctf.contains(&t2));
     }
 
-    fn make_db_rules_path(object_store: &ObjectStore, server_id: ServerId, db_name: &str) -> Path {
+    fn make_db_rules_path(object_store: &ObjectStore, server_id: ServerId, uuid: Uuid) -> Path {
         let mut p = object_store.new_path();
-        p.push_all_dirs(&[&server_id.to_string(), db_name, "0"]);
+        p.push_all_dirs(&[server_id.to_string().as_str(), uuid.to_string().as_str()]);
         p.set_file_name("rules.pb");
         p
     }
@@ -823,12 +686,11 @@ mod tests {
     async fn db_rules_should_be_a_file() {
         let object_store = make_object_store();
         let server_id = make_server_id();
-        let database_name = DatabaseName::new("clouds").unwrap();
-        let rules_path = make_db_rules_path(&object_store, server_id, "clouds");
-        let iox_object_store =
-            IoxObjectStore::new(Arc::clone(&object_store), server_id, &database_name)
-                .await
-                .unwrap();
+        let uuid = Uuid::new_v4();
+        let rules_path = make_db_rules_path(&object_store, server_id, uuid);
+        let iox_object_store = IoxObjectStore::new(Arc::clone(&object_store), server_id, uuid)
+            .await
+            .unwrap();
 
         // PUT
         let original_file_content = Bytes::from("hello world");
@@ -879,19 +741,14 @@ mod tests {
     async fn write_tombstone_twice_is_fine() {
         let object_store = make_object_store();
         let server_id = make_server_id();
-        let database_name = DatabaseName::new("clouds").unwrap();
-        let iox_object_store =
-            IoxObjectStore::new(Arc::clone(&object_store), server_id, &database_name)
-                .await
-                .unwrap();
+        let uuid = Uuid::new_v4();
+        let iox_object_store = IoxObjectStore::new(Arc::clone(&object_store), server_id, uuid)
+            .await
+            .unwrap();
 
         // tombstone file should not exist
         let mut tombstone = object_store.new_path();
-        tombstone.push_all_dirs([
-            server_id.to_string().as_str(),
-            database_name.to_string().as_str(),
-            "0",
-        ]);
+        tombstone.push_all_dirs([server_id.to_string().as_str(), uuid.to_string().as_str()]);
         tombstone.set_file_name("DELETED");
 
         object_store.get(&tombstone).await.err().unwrap();
@@ -909,78 +766,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_then_create_new_with_same_name() {
+    async fn create_new_with_same_uuid_errors() {
         let object_store = make_object_store();
         let server_id = make_server_id();
-        let database_name = DatabaseName::new("clouds").unwrap();
-        let root_path = RootPath::new(&object_store, server_id, &database_name);
+        let uuid = Uuid::new_v4();
 
-        let iox_object_store =
-            IoxObjectStore::new(Arc::clone(&object_store), server_id, &database_name)
-                .await
-                .unwrap();
+        let iox_object_store = IoxObjectStore::new(Arc::clone(&object_store), server_id, uuid)
+            .await
+            .unwrap();
 
         iox_object_store
             .put_database_rules_file(Bytes::new())
             .await
             .unwrap();
 
-        let generations = IoxObjectStore::list_generations(&object_store, &root_path)
+        let err = IoxObjectStore::new(Arc::clone(&object_store), server_id, uuid)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IoxObjectStoreError::DatabaseAlreadyExists { uuid: err_uuid } if err_uuid == uuid),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn create_new_with_any_files_under_uuid_errors() {
+        let object_store = make_object_store();
+        let server_id = make_server_id();
+        let uuid = Uuid::new_v4();
+
+        let mut not_rules_path = object_store.new_path();
+        not_rules_path.push_all_dirs(&[server_id.to_string().as_str(), uuid.to_string().as_str()]);
+        not_rules_path.set_file_name("not_rules.txt");
+        object_store
+            .put(&not_rules_path, Bytes::new())
             .await
             .unwrap();
-        assert_eq!(generations.len(), 1);
-        assert_eq!(
-            generations[0],
-            Generation {
-                id: GenerationId { inner: 0 },
-                deleted_at: None,
-            }
-        );
 
+        let err = IoxObjectStore::new(Arc::clone(&object_store), server_id, uuid)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IoxObjectStoreError::DatabaseAlreadyExists { uuid: err_uuid } if err_uuid == uuid),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_then_create_new_with_same_uuid_errors() {
+        let object_store = make_object_store();
+        let server_id = make_server_id();
+        let uuid = Uuid::new_v4();
+
+        let iox_object_store = IoxObjectStore::new(Arc::clone(&object_store), server_id, uuid)
+            .await
+            .unwrap();
+
+        iox_object_store
+            .put_database_rules_file(Bytes::new())
+            .await
+            .unwrap();
         iox_object_store.write_tombstone().await.unwrap();
 
-        let generations = IoxObjectStore::list_generations(&object_store, &root_path)
+        let err = IoxObjectStore::new(Arc::clone(&object_store), server_id, uuid)
             .await
-            .unwrap();
-        assert_eq!(generations.len(), 1);
-        assert_eq!(generations[0].id, GenerationId { inner: 0 });
-        assert!(!generations[0].is_active());
-
-        let iox_object_store =
-            IoxObjectStore::new(Arc::clone(&object_store), server_id, &database_name)
-                .await
-                .unwrap();
-
-        iox_object_store
-            .put_database_rules_file(Bytes::new())
-            .await
-            .unwrap();
-
-        let mut generations = IoxObjectStore::list_generations(&object_store, &root_path)
-            .await
-            .unwrap();
-        assert_eq!(generations.len(), 2);
-        generations.sort_by_key(|g| g.id);
-        assert_eq!(generations[0].id, GenerationId { inner: 0 });
-        assert!(!generations[0].is_active());
-        assert_eq!(
-            generations[1],
-            Generation {
-                id: GenerationId { inner: 1 },
-                deleted_at: None,
-            }
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IoxObjectStoreError::DatabaseAlreadyExists { uuid: err_uuid } if err_uuid == uuid),
+            "got: {:?}",
+            err
         );
     }
 
     async fn create_database(
         object_store: Arc<ObjectStore>,
         server_id: ServerId,
-        database_name: &DatabaseName<'static>,
+        uuid: Uuid,
     ) -> IoxObjectStore {
-        let iox_object_store =
-            IoxObjectStore::new(Arc::clone(&object_store), server_id, database_name)
-                .await
-                .unwrap();
+        let iox_object_store = IoxObjectStore::new(Arc::clone(&object_store), server_id, uuid)
+            .await
+            .unwrap();
 
         iox_object_store
             .put_database_rules_file(Bytes::new())
@@ -1000,33 +873,39 @@ mod tests {
         let server_id = make_server_id();
 
         // Create a normal database, will be in the list
-        let db_normal = DatabaseName::new("db_normal").unwrap();
-        create_database(Arc::clone(&object_store), server_id, &db_normal).await;
+        let db_normal = Uuid::new_v4();
+        create_database(Arc::clone(&object_store), server_id, db_normal).await;
 
         // Create a database, then delete it - will still be in the list
-        let db_deleted = DatabaseName::new("db_deleted").unwrap();
+        let db_deleted = Uuid::new_v4();
         let db_deleted_iox_store =
-            create_database(Arc::clone(&object_store), server_id, &db_deleted).await;
+            create_database(Arc::clone(&object_store), server_id, db_deleted).await;
         delete_database(&db_deleted_iox_store).await;
 
         // Put a file in a directory that looks like a database directory but has no rules,
         // will still be in the list
-        let not_a_db = DatabaseName::new("not_a_db").unwrap();
+        let not_a_db = Uuid::new_v4();
         let mut not_rules_path = object_store.new_path();
-        not_rules_path.push_all_dirs(&[&server_id.to_string(), not_a_db.as_str(), "0"]);
+        not_rules_path.push_all_dirs(&[
+            server_id.to_string().as_str(),
+            not_a_db.to_string().as_str(),
+        ]);
         not_rules_path.set_file_name("not_rules.txt");
         object_store
             .put(&not_rules_path, Bytes::new())
             .await
             .unwrap();
 
-        // Put a file in a directory that's an invalid database name - this WON'T be in the list
-        let invalid_db_name = ("a".repeat(65)).to_string();
-        let mut invalid_db_name_rules_path = object_store.new_path();
-        invalid_db_name_rules_path.push_all_dirs(&[&server_id.to_string(), &invalid_db_name, "0"]);
-        invalid_db_name_rules_path.set_file_name("rules.pb");
+        // Put a file in a directory that's an invalid UUID - this WON'T be in the list
+        let invalid_db = String::from("a");
+        let mut invalid_db_rules_path = object_store.new_path();
+        invalid_db_rules_path.push_all_dirs(&[
+            server_id.to_string().as_str(),
+            invalid_db.to_string().as_str(),
+        ]);
+        invalid_db_rules_path.set_file_name("rules.pb");
         object_store
-            .put(&invalid_db_name_rules_path, Bytes::new())
+            .put(&invalid_db_rules_path, Bytes::new())
             .await
             .unwrap();
 
@@ -1034,118 +913,10 @@ mod tests {
             .await
             .unwrap();
         possible.sort();
-        assert_eq!(possible, vec![db_deleted, db_normal, not_a_db]);
-    }
+        let mut expected = vec![db_deleted, db_normal, not_a_db];
+        expected.sort();
 
-    #[tokio::test]
-    async fn list_all_databases_returns_generation_info() {
-        let object_store = make_object_store();
-        let server_id = make_server_id();
-
-        // Create a normal database, will be in the list with one active generation
-        let db_normal = DatabaseName::new("db_normal").unwrap();
-        create_database(Arc::clone(&object_store), server_id, &db_normal).await;
-
-        // Create a database, then delete it - will be in the list with one inactive generation
-        let db_deleted = DatabaseName::new("db_deleted").unwrap();
-        let db_deleted_iox_store =
-            create_database(Arc::clone(&object_store), server_id, &db_deleted).await;
-        delete_database(&db_deleted_iox_store).await;
-
-        // Create, delete, create - will be in the list with one active and one inactive generation
-        let db_reincarnated = DatabaseName::new("db_reincarnated").unwrap();
-        let db_reincarnated_iox_store =
-            create_database(Arc::clone(&object_store), server_id, &db_reincarnated).await;
-        delete_database(&db_reincarnated_iox_store).await;
-        create_database(Arc::clone(&object_store), server_id, &db_reincarnated).await;
-
-        // Put a file in a directory that looks like a database directory but has no rules,
-        // will still be in the list with one active generation
-        let not_a_db = DatabaseName::new("not_a_db").unwrap();
-        let mut not_rules_path = object_store.new_path();
-        not_rules_path.push_all_dirs(&[&server_id.to_string(), not_a_db.as_str(), "0"]);
-        not_rules_path.set_file_name("not_rules.txt");
-        object_store
-            .put(&not_rules_path, Bytes::new())
-            .await
-            .unwrap();
-
-        // Put a file in a directory that's an invalid database name - this WON'T be in the list
-        let invalid_db_name = ("a".repeat(65)).to_string();
-        let mut invalid_db_name_rules_path = object_store.new_path();
-        invalid_db_name_rules_path.push_all_dirs(&[&server_id.to_string(), &invalid_db_name, "0"]);
-        invalid_db_name_rules_path.set_file_name("rules.pb");
-        object_store
-            .put(&invalid_db_name_rules_path, Bytes::new())
-            .await
-            .unwrap();
-
-        // Put a file in a directory that looks like a database name, but doesn't look like a
-        // generation directory - the database will be in the list but the generations will
-        // be empty.
-        let no_generations = DatabaseName::new("no_generations").unwrap();
-        let mut no_generations_path = object_store.new_path();
-        no_generations_path.push_all_dirs(&[
-            &server_id.to_string(),
-            no_generations.as_str(),
-            "not-a-generation",
-        ]);
-        no_generations_path.set_file_name("not_rules.txt");
-        object_store
-            .put(&no_generations_path, Bytes::new())
-            .await
-            .unwrap();
-
-        let all_dbs = IoxObjectStore::list_all_databases(&object_store, server_id)
-            .await
-            .unwrap();
-
-        let db_names: Vec<_> = all_dbs.keys().collect();
-        assert_eq!(
-            db_names,
-            vec![
-                &db_deleted,
-                &db_normal,
-                &db_reincarnated,
-                &no_generations,
-                &not_a_db
-            ]
-        );
-
-        let db_normal_generations = all_dbs.get(&db_normal).unwrap();
-        assert_eq!(db_normal_generations.len(), 1);
-        assert_eq!(db_normal_generations[0].id, GenerationId { inner: 0 });
-        assert!(db_normal_generations[0].is_active());
-
-        let db_deleted_generations = all_dbs.get(&db_deleted).unwrap();
-        assert_eq!(db_deleted_generations.len(), 1);
-        assert_eq!(db_deleted_generations[0].id, GenerationId { inner: 0 });
-        assert!(!db_deleted_generations[0].is_active());
-
-        let mut db_reincarnated_generations = all_dbs.get(&db_reincarnated).unwrap().clone();
-        db_reincarnated_generations.sort_by_key(|g| g.id);
-        assert_eq!(db_reincarnated_generations.len(), 2);
-        assert_eq!(db_reincarnated_generations[0].id, GenerationId { inner: 0 });
-        assert!(!db_reincarnated_generations[0].is_active());
-        assert_eq!(db_reincarnated_generations[1].id, GenerationId { inner: 1 });
-        assert!(db_reincarnated_generations[1].is_active());
-
-        // There is a database-looking directory with a generation-looking directory inside it
-        // that doesn't have a tombstone file, so as far as we know at this point this is a
-        // database. Actually using this database and finding out it's invalid is out of scope.
-        let not_a_db_generations = all_dbs.get(&not_a_db).unwrap();
-        assert_eq!(not_a_db_generations.len(), 1);
-        assert_eq!(not_a_db_generations[0].id, GenerationId { inner: 0 });
-        assert!(not_a_db_generations[0].is_active());
-
-        // There are files in this database directory, but none of them look like generation
-        // directories, so generations is empty.
-        let no_generations_generations = all_dbs.get(&no_generations).unwrap();
-        assert!(
-            no_generations_generations.is_empty(),
-            "got {:?}",
-            no_generations_generations
-        );
+        assert_eq!(possible, expected);
     }
 
     #[tokio::test]
@@ -1154,100 +925,59 @@ mod tests {
         let server_id = make_server_id();
 
         // Create a normal database, will NOT be in the list of deleted databases
-        let db_normal = DatabaseName::new("db_normal").unwrap();
-        create_database(Arc::clone(&object_store), server_id, &db_normal).await;
+        let db_normal = Uuid::new_v4();
+        create_database(Arc::clone(&object_store), server_id, db_normal).await;
 
         // Create a database, then delete it - will be in the list once
-        let db_deleted = DatabaseName::new("db_deleted").unwrap();
+        let db_deleted = Uuid::new_v4();
         let db_deleted_iox_store =
-            create_database(Arc::clone(&object_store), server_id, &db_deleted).await;
+            create_database(Arc::clone(&object_store), server_id, db_deleted).await;
         delete_database(&db_deleted_iox_store).await;
-
-        // Create, delete, create - will be in the list once
-        let db_reincarnated = DatabaseName::new("db_reincarnated").unwrap();
-        let db_reincarnated_iox_store =
-            create_database(Arc::clone(&object_store), server_id, &db_reincarnated).await;
-        delete_database(&db_reincarnated_iox_store).await;
-        create_database(Arc::clone(&object_store), server_id, &db_reincarnated).await;
-
-        // Create, delete, create, delete - will be in the list twice
-        let db_deleted_twice = DatabaseName::new("db_deleted_twice").unwrap();
-        let db_deleted_twice_iox_store =
-            create_database(Arc::clone(&object_store), server_id, &db_deleted_twice).await;
-        delete_database(&db_deleted_twice_iox_store).await;
-        let db_deleted_twice_iox_store =
-            create_database(Arc::clone(&object_store), server_id, &db_deleted_twice).await;
-        delete_database(&db_deleted_twice_iox_store).await;
 
         // Put a file in a directory that looks like a database directory but has no rules,
         // won't be in the list because there's no tombstone file
-        let not_a_db = DatabaseName::new("not_a_db").unwrap();
+        let not_a_db = Uuid::new_v4();
         let mut not_rules_path = object_store.new_path();
-        not_rules_path.push_all_dirs(&[&server_id.to_string(), not_a_db.as_str(), "0"]);
+        not_rules_path.push_all_dirs(&[
+            server_id.to_string().as_str(),
+            not_a_db.to_string().as_str(),
+        ]);
         not_rules_path.set_file_name("not_rules.txt");
         object_store
             .put(&not_rules_path, Bytes::new())
             .await
             .unwrap();
 
-        // Put a file in a directory that's an invalid database name - won't be in the list
-        let invalid_db_name = ("a".repeat(65)).to_string();
-        let mut invalid_db_name_rules_path = object_store.new_path();
-        invalid_db_name_rules_path.push_all_dirs(&[&server_id.to_string(), &invalid_db_name, "0"]);
-        invalid_db_name_rules_path.set_file_name("rules.pb");
-        object_store
-            .put(&invalid_db_name_rules_path, Bytes::new())
-            .await
-            .unwrap();
-
-        // Put a file in a directory that looks like a database name, but doesn't look like a
-        // generation directory - won't be in the list
-        let no_generations = DatabaseName::new("no_generations").unwrap();
-        let mut no_generations_path = object_store.new_path();
-        no_generations_path.push_all_dirs(&[
-            &server_id.to_string(),
-            no_generations.as_str(),
-            "not-a-generation",
+        // Put a file in a directory that's an invalid UUID - won't be in the list
+        let invalid_db = String::from("a");
+        let mut invalid_db_rules_path = object_store.new_path();
+        invalid_db_rules_path.push_all_dirs(&[
+            server_id.to_string().as_str(),
+            invalid_db.to_string().as_str(),
         ]);
-        no_generations_path.set_file_name("not_rules.txt");
+        invalid_db_rules_path.set_file_name("rules.pb");
         object_store
-            .put(&no_generations_path, Bytes::new())
+            .put(&invalid_db_rules_path, Bytes::new())
             .await
             .unwrap();
 
-        let mut deleted_dbs = IoxObjectStore::list_deleted_databases(&object_store, server_id)
+        let deleted_dbs = IoxObjectStore::list_deleted_databases(&object_store, server_id)
             .await
             .unwrap();
 
-        deleted_dbs.sort_by_key(|d| (d.name.clone(), d.generation_id));
+        dbg!(&deleted_dbs);
 
-        assert_eq!(deleted_dbs.len(), 4);
-
-        assert_eq!(deleted_dbs[0].name, db_deleted);
-        assert_eq!(deleted_dbs[0].generation_id.inner, 0);
-
-        assert_eq!(deleted_dbs[1].name, db_deleted_twice);
-        assert_eq!(deleted_dbs[1].generation_id.inner, 0);
-        assert_eq!(deleted_dbs[2].name, db_deleted_twice);
-        assert_eq!(deleted_dbs[2].generation_id.inner, 1);
-
-        assert_eq!(deleted_dbs[3].name, db_reincarnated);
-        assert_eq!(deleted_dbs[3].generation_id.inner, 0);
+        assert_eq!(deleted_dbs.len(), 1);
+        assert_eq!(deleted_dbs[0].uuid, db_deleted);
+        assert!(deleted_dbs[0].deleted_at.is_some());
     }
 
     async fn restore_database(
         object_store: Arc<ObjectStore>,
         server_id: ServerId,
-        database_name: &DatabaseName<'static>,
-        generation_id: GenerationId,
+        uuid: Uuid,
     ) -> Result<IoxObjectStore, IoxObjectStoreError> {
-        IoxObjectStore::restore_database(
-            Arc::clone(&object_store),
-            server_id,
-            database_name,
-            generation_id,
-        )
-        .await
+        IoxObjectStore::restore_database(Arc::clone(&object_store), server_id, uuid).await
     }
 
     #[tokio::test]
@@ -1256,58 +986,55 @@ mod tests {
         let server_id = make_server_id();
 
         // Create a database
-        let db = DatabaseName::new("db").unwrap();
-        let db_iox_store = create_database(Arc::clone(&object_store), server_id, &db).await;
+        let db = Uuid::new_v4();
+        let db_iox_store = create_database(Arc::clone(&object_store), server_id, db).await;
 
         // Delete the database
         delete_database(&db_iox_store).await;
 
-        // Create and delete it again so there are two deleted generations
-        let db_iox_store = create_database(Arc::clone(&object_store), server_id, &db).await;
-        delete_database(&db_iox_store).await;
-
-        // Get one generation ID from the list of deleted databases
-        let deleted_dbs = IoxObjectStore::list_deleted_databases(&object_store, server_id)
+        // Restore the database
+        restore_database(Arc::clone(&object_store), server_id, db)
             .await
             .unwrap();
-        assert_eq!(deleted_dbs.len(), 2);
-        let deleted_db = deleted_dbs.iter().find(|d| d.name == db).unwrap();
-
-        // Restore the generation
-        restore_database(
-            Arc::clone(&object_store),
-            server_id,
-            &db,
-            deleted_db.generation_id,
-        )
-        .await
-        .unwrap();
 
         // The database should be in the list of all databases again
-        let all_dbs = IoxObjectStore::list_all_databases(&object_store, server_id)
+        let all_dbs = IoxObjectStore::list_detailed_databases(&object_store, server_id)
             .await
             .unwrap();
         assert_eq!(all_dbs.len(), 1);
+    }
 
-        // The other deleted generation should be the only item in the deleted list
-        let deleted_dbs = IoxObjectStore::list_deleted_databases(&object_store, server_id)
+    #[tokio::test]
+    async fn test_find_existing() {
+        let object_store = make_object_store();
+        let server_id = make_server_id();
+
+        // Find existing can't find nonexistent database
+        let nonexistent = Uuid::new_v4();
+        let returned =
+            IoxObjectStore::find_existing(Arc::clone(&object_store), server_id, nonexistent)
+                .await
+                .unwrap();
+        assert!(returned.is_none());
+
+        // Create a database
+        let db = Uuid::new_v4();
+        let db_iox_store = create_database(Arc::clone(&object_store), server_id, db).await;
+
+        // Find existing should return that database
+        let returned = IoxObjectStore::find_existing(Arc::clone(&object_store), server_id, db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(returned.uuid(), db);
+
+        // Delete a database
+        delete_database(&db_iox_store).await;
+
+        // Find existing can't find deleted database
+        let returned = IoxObjectStore::find_existing(Arc::clone(&object_store), server_id, db)
             .await
             .unwrap();
-        assert_eq!(deleted_dbs.len(), 1);
-
-        // Try to restore the other deleted database
-        let deleted_db = deleted_dbs.iter().find(|d| d.name == db).unwrap();
-        let err = restore_database(
-            Arc::clone(&object_store),
-            server_id,
-            &db,
-            deleted_db.generation_id,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "Cannot restore; there is already an active database named `db`"
-        );
+        assert!(returned.is_none());
     }
 }

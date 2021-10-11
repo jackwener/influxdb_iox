@@ -7,10 +7,7 @@ use crate::{
     rules::ProvidedDatabaseRules,
     ApplicationState, Db,
 };
-use data_types::{
-    database_rules::WriteBufferDirection, detailed_database::GenerationId, server_id::ServerId,
-    DatabaseName,
-};
+use data_types::{database_rules::WriteBufferDirection, server_id::ServerId, DatabaseName};
 use futures::{
     future::{BoxFuture, FusedFuture, Shared},
     FutureExt, TryFutureExt,
@@ -35,40 +32,40 @@ mod metrics;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "a state transition is already in progress for database ({}) in state {}",
+        "a state transition is already in progress for database ({:?}) in state {}",
         db_name,
         state
     ))]
     TransitionInProgress {
-        db_name: String,
+        db_name: Option<String>,
         state: DatabaseStateCode,
     },
 
     #[snafu(display(
-        "database ({}) in invalid state ({:?}) for transition ({})",
+        "database ({:?}) in invalid state ({:?}) for transition ({})",
         db_name,
         state,
         transition
     ))]
     InvalidState {
-        db_name: String,
+        db_name: Option<String>,
         state: DatabaseStateCode,
         transition: String,
     },
 
     #[snafu(display(
-        "failed to wipe preserved catalog of database ({}): {}",
+        "failed to wipe preserved catalog of database ({:?}): {}",
         db_name,
         source
     ))]
     WipePreservedCatalog {
-        db_name: String,
+        db_name: Option<String>,
         source: Box<parquet_file::catalog::core::Error>,
     },
 
-    #[snafu(display("failed to skip replay for database ({}): {}", db_name, source))]
+    #[snafu(display("failed to skip replay for database ({:?}): {}", db_name, source))]
     SkipReplay {
-        db_name: String,
+        db_name: Option<String>,
         source: Box<InitError>,
     },
 
@@ -81,17 +78,20 @@ pub enum Error {
     #[snafu(display("cannot persisted updated rules: {}", source))]
     CannotPersistUpdatedRules { source: crate::rules::Error },
 
-    #[snafu(display("cannot mark database deleted: {}", source))]
+    #[snafu(display("cannot mark database {:?} deleted: {}", db_name, source))]
     CannotMarkDatabaseDeleted {
-        db_name: String,
+        db_name: Option<String>,
         source: object_store::Error,
     },
 
-    #[snafu(display("no active database named {} to delete", db_name))]
-    NoActiveDatabaseToDelete { db_name: String },
+    #[snafu(display(
+        "cannot delete database named {:?} that has already been marked as deleted",
+        db_name
+    ))]
+    CannotDeleteInactiveDatabase { db_name: Option<String> },
 
-    #[snafu(display("cannot restore database named {} that is already active", db_name))]
-    CannotRestoreActiveDatabase { db_name: String },
+    #[snafu(display("cannot restore database named {:?} that is already active", db_name))]
+    CannotRestoreActiveDatabase { db_name: Option<String> },
 
     #[snafu(display("{}", source))]
     CannotRestoreDatabaseInObjectStorage {
@@ -148,9 +148,7 @@ pub struct Database {
 /// Information about where a database is located on object store,
 /// and how to perform startup activities.
 pub struct DatabaseConfig {
-    pub name: DatabaseName<'static>,
-    // TODO: this should be required when UUID is used in the database's object store path
-    pub uuid: Option<Uuid>,
+    pub uuid: Uuid,
     pub server_id: ServerId,
     pub wipe_catalog_on_error: bool,
     pub skip_replay: bool,
@@ -163,12 +161,13 @@ impl Database {
     /// past.
     pub fn new(application: Arc<ApplicationState>, config: DatabaseConfig) -> Self {
         info!(
-            db_name=%config.name,
+            db_uuid=%config.uuid,
             "new database"
         );
 
-        let metrics =
-            metrics::Metrics::new(application.metric_registry().as_ref(), config.name.as_str());
+        // TODO: we no longer have the name here
+        // let metrics =
+        //     metrics::Metrics::new(application.metric_registry().as_ref(), config.name.as_str());
 
         let shared = Arc::new(DatabaseShared {
             config,
@@ -176,7 +175,8 @@ impl Database {
             shutdown: Default::default(),
             state: RwLock::new(Freezable::new(DatabaseState::Known(DatabaseStateKnown {}))),
             state_notify: Default::default(),
-            metrics,
+            // TODO: we no longer have the name here
+            // metrics,
         });
 
         let handle = tokio::spawn(background_worker(Arc::clone(&shared)));
@@ -194,19 +194,15 @@ impl Database {
     ) -> Result<(), InitError> {
         let db_name = provided_rules.db_name();
         let iox_object_store = Arc::new(
-            match IoxObjectStore::new(Arc::clone(application.object_store()), server_id, db_name)
-                .await
+            match IoxObjectStore::new(Arc::clone(application.object_store()), server_id, uuid).await
             {
                 Ok(ios) => ios,
-                Err(iox_object_store::IoxObjectStoreError::DatabaseAlreadyExists { name }) => {
-                    return Err(InitError::DatabaseAlreadyExists { name })
-                }
                 Err(source) => return Err(InitError::IoxObjectStoreError { source }),
             },
         );
 
         provided_rules
-            .persist(uuid, &iox_object_store)
+            .persist(&iox_object_store)
             .await
             .context(SavingRules)?;
 
@@ -225,8 +221,8 @@ impl Database {
 
     /// Mark this database as deleted.
     pub async fn delete(&self) -> Result<(), Error> {
-        let db_name = &self.shared.config.name;
-        info!(%db_name, "marking database deleted");
+        let db_name = self.name().map(|n| n.to_string());
+        info!(db_uuid=%self.config().uuid, ?db_name, "marking database deleted");
 
         let handle = self.shared.state.read().freeze();
         let handle = handle.await;
@@ -234,7 +230,7 @@ impl Database {
         {
             let state = self.shared.state.read();
             // Can't delete an already deleted database.
-            ensure!(state.is_active(), NoActiveDatabaseToDelete { db_name });
+            ensure!(state.is_active(), CannotDeleteInactiveDatabase { db_name });
         }
 
         // If there is an object store for this database, write out a tombstone file.
@@ -244,7 +240,7 @@ impl Database {
             .with_context(|| {
                 let state = self.shared.state.read();
                 TransitionInProgress {
-                    db_name,
+                    db_name: db_name.clone(),
                     state: state.state_code(),
                 }
             })?
@@ -263,10 +259,10 @@ impl Database {
         Ok(())
     }
 
-    /// Mark this database generation as restored.
-    pub async fn restore(&self, generation_id: usize) -> Result<(), Error> {
-        let db_name = &self.shared.config.name;
-        info!(%db_name, %generation_id, "restoring database");
+    /// Mark this database as restored.
+    pub async fn restore(&self) -> Result<(), Error> {
+        let db_name = self.name().map(|n| n.to_string());
+        info!(?db_name, "restoring database");
 
         let handle = self.shared.state.read().freeze();
         let handle = handle.await;
@@ -280,10 +276,7 @@ impl Database {
         IoxObjectStore::restore_database(
             Arc::clone(self.shared.application.object_store()),
             self.shared.config.server_id,
-            db_name,
-            GenerationId {
-                inner: generation_id,
-            },
+            self.shared.config.uuid,
         )
         .await
         .context(CannotRestoreDatabaseInObjectStorage)?;
@@ -293,14 +286,15 @@ impl Database {
         let mut state = state.unfreeze(handle);
         *state = DatabaseState::Known(DatabaseStateKnown {});
         self.shared.state_notify.notify_waiters();
-        info!(%db_name, "set database state to object store found");
+        info!(?db_name, "set database state to object store found");
 
         Ok(())
     }
 
     /// Triggers shutdown of this `Database`
     pub fn shutdown(&self) {
-        info!(db_name=%self.shared.config.name, "database shutting down");
+        let db_name = self.name();
+        info!(?db_name, "database shutting down");
         self.shared.shutdown.cancel()
     }
 
@@ -337,6 +331,12 @@ impl Database {
     /// Returns the database rules if they're loaded
     pub fn provided_rules(&self) -> Option<Arc<ProvidedDatabaseRules>> {
         self.shared.state.read().provided_rules()
+    }
+
+    /// Returns the database name if the rules are loaded
+    pub fn name(&self) -> Option<DatabaseName<'static>> {
+        self.provided_rules()
+            .map(|rules| rules.db_name().to_owned())
     }
 
     /// Update the database rules, panic'ing if the state is invalid
@@ -386,12 +386,7 @@ impl Database {
         // Even though we don't hold a lock here, the freeze handle
         // ensures the state can not be modified.
         new_provided_rules
-            .persist(
-                // TODO: Transition: this default value will go away once `uuid` can be read from
-                // the object store path; we'll always have it in that case.
-                self.config().uuid.unwrap_or_else(Uuid::new_v4),
-                &iox_object_store,
-            )
+            .persist(&iox_object_store)
             .await
             .context(CannotPersistUpdatedRules)?;
 
@@ -459,15 +454,17 @@ impl Database {
     }
 
     /// Recover from a CatalogLoadError by wiping the catalog
-    pub fn wipe_preserved_catalog(&self) -> Result<impl Future<Output = Result<(), Error>>, Error> {
-        let db_name = &self.shared.config.name;
+    pub fn wipe_preserved_catalog(
+        self: Arc<Self>,
+    ) -> Result<impl Future<Output = Result<(), Error>>, Error> {
+        let db_name = self.name();
         let (current_state, handle) = {
             let state = self.shared.state.read();
             let current_state = match &**state {
                 DatabaseState::CatalogLoadError(rules_loaded, _) => rules_loaded.clone(),
                 _ => {
                     return InvalidState {
-                        db_name,
+                        db_name: db_name.map(|dbn| dbn.to_string()),
                         state: state.state_code(),
                         transition: "WipePreservedCatalog",
                     }
@@ -476,7 +473,7 @@ impl Database {
             };
 
             let handle = state.try_freeze().context(TransitionInProgress {
-                db_name,
+                db_name: db_name.map(|dbn| dbn.to_string()),
                 state: state.state_code(),
             })?;
 
@@ -486,12 +483,14 @@ impl Database {
         let shared = Arc::clone(&self.shared);
 
         Ok(async move {
-            let db_name = &shared.config.name;
+            let db_name = self.name();
 
             PreservedCatalog::wipe(&current_state.iox_object_store)
                 .await
                 .map_err(Box::new)
-                .context(WipePreservedCatalog { db_name })?;
+                .context(WipePreservedCatalog {
+                    db_name: db_name.map(|dbn| dbn.to_string()),
+                })?;
 
             {
                 let mut state = shared.state.write();
@@ -504,7 +503,7 @@ impl Database {
 
     /// Recover from a ReplayError by skipping replay
     pub async fn skip_replay(&self) -> Result<(), Error> {
-        let db_name = &self.shared.config.name;
+        let db_name = self.name();
 
         let handle = self.shared.state.read().freeze();
         let handle = handle.await;
@@ -515,7 +514,7 @@ impl Database {
                 DatabaseState::ReplayError(rules_loaded, _) => rules_loaded.clone(),
                 _ => {
                     return InvalidState {
-                        db_name,
+                        db_name: db_name.map(|dbn| dbn.to_string()),
                         state: state.state_code(),
                         transition: "SkipReplay",
                     }
@@ -529,7 +528,9 @@ impl Database {
             .advance(self.shared.as_ref())
             .await
             .map_err(Box::new)
-            .context(SkipReplay { db_name })?;
+            .context(SkipReplay {
+                db_name: db_name.map(|dbn| dbn.to_string()),
+            })?;
 
         let mut state = self.shared.state.write();
         *state.unfreeze(handle) = DatabaseState::Initialized(current_state);
@@ -543,7 +544,8 @@ impl Database {
     /// - write it to a local `Db`
     ///
     pub async fn write_entry(&self, entry: entry::Entry) -> Result<(), WriteError> {
-        let recorder = self.shared.metrics.entry_ingest(entry.data().len());
+        // TODO: we no longer have the metrics here
+        // let recorder = self.shared.metrics.entry_ingest(entry.data().len());
 
         let db = {
             let state = self.shared.state.read();
@@ -574,21 +576,26 @@ impl Database {
             }
         })?;
 
-        recorder.success();
+        // TODO: we no longer have the metrics here
+        // recorder.success();
+
         Ok(())
     }
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
-        let db_name = &self.shared.config.name;
+        let db_name = self.name();
         if !self.shared.shutdown.is_cancelled() {
-            warn!(%db_name, "database dropped without calling shutdown()");
+            warn!(?db_name, "database dropped without calling shutdown()");
             self.shared.shutdown.cancel();
         }
 
         if self.join.clone().now_or_never().is_none() {
-            warn!(%db_name, "database dropped without waiting for worker termination");
+            warn!(
+                ?db_name,
+                "database dropped without waiting for worker termination"
+            );
         }
     }
 }
@@ -612,21 +619,24 @@ struct DatabaseShared {
 
     /// Notify that the database state has changed
     state_notify: Notify,
-
-    /// Metrics for this database
-    metrics: metrics::Metrics,
 }
 
 /// The background worker for `Database` - there should only ever be one
 async fn background_worker(shared: Arc<DatabaseShared>) {
-    info!(db_name=%shared.config.name, "started database background worker");
+    let db_uuid = shared.config.uuid;
+    info!(%db_uuid, "started database background worker");
+    let db_name = shared
+        .state
+        .read()
+        .provided_rules()
+        .map(|rules| rules.db_name().to_string());
 
     // The background loop runs until `Database::shutdown` is called
     while !shared.shutdown.is_cancelled() {
         initialize_database(shared.as_ref()).await;
 
         if shared.shutdown.is_cancelled() {
-            info!(db_name=%shared.config.name, "database shutdown before finishing initialization");
+            info!(%db_uuid, "database shutdown before finishing initialization");
             break;
         }
 
@@ -641,12 +651,12 @@ async fn background_worker(shared: Arc<DatabaseShared>) {
             .expect("expected initialized")
             .clone();
 
-        info!(db_name=%shared.config.name, "database finished initialization - starting Db worker");
+        info!(%db_uuid, "database finished initialization - starting Db worker");
 
         crate::utils::panic_test(|| {
             Some(format!(
                 "database background worker: {}",
-                shared.config.name
+                shared.config.uuid
             ))
         });
 
@@ -674,7 +684,7 @@ async fn background_worker(shared: Arc<DatabaseShared>) {
             futures::pin_mut!(notify);
 
             if shared.state.read().get_initialized().is_none() {
-                info!(db_name=%shared.config.name, "database no longer initialized");
+                info!(%db_uuid, ?db_name, "database no longer initialized");
                 break;
             }
 
@@ -688,32 +698,32 @@ async fn background_worker(shared: Arc<DatabaseShared>) {
                 _ = shutdown => info!("database shutting down"),
                 _ = notify => info!("notified of state change"),
                 _ = consumer_join => {
-                    error!(db_name=%shared.config.name, "unexpected shutdown of write buffer consumer - bailing out");
+                    error!(?db_name, "unexpected shutdown of write buffer consumer - bailing out");
                     shared.shutdown.cancel();
                 }
                 _ = db_worker => {
-                    error!(db_name=%shared.config.name, "unexpected shutdown of db - bailing out");
+                    error!(?db_name, "unexpected shutdown of db - bailing out");
                     shared.shutdown.cancel();
                 }
             }
         }
 
         if let Some(consumer) = write_buffer_consumer {
-            info!(db_name=%shared.config.name, "shutting down write buffer consumer");
+            info!(?db_name, "shutting down write buffer consumer");
             consumer.shutdown();
             if let Err(e) = consumer.join().await {
-                error!(db_name=%shared.config.name, %e, "error shutting down write buffer consumer")
+                error!(?db_name, %e, "error shutting down write buffer consumer")
             }
         }
 
         if !db_worker.is_terminated() {
-            info!(db_name=%shared.config.name, "waiting for db worker shutdown");
+            info!(?db_name, "waiting for db worker shutdown");
             db_shutdown.cancel();
             db_worker.await
         }
     }
 
-    info!(db_name=%shared.config.name, "draining tasks");
+    info!(?db_name, "draining tasks");
 
     // Loop in case tasks are spawned during shutdown
     loop {
@@ -724,8 +734,8 @@ async fn background_worker(shared: Arc<DatabaseShared>) {
         let mut futures: FuturesUnordered<_> = jobs
             .iter()
             .filter_map(|tracker| {
-                let db_name = tracker.metadata().db_name()?;
-                if db_name.as_ref() != shared.config.name.as_str() {
+                let job_db_name = tracker.metadata().db_name()?;
+                if db_name.is_none() || job_db_name.as_ref() != db_name.as_ref().unwrap().as_str() {
                     return None;
                 }
                 Some(tracker.join())
@@ -736,19 +746,23 @@ async fn background_worker(shared: Arc<DatabaseShared>) {
             break;
         }
 
-        info!(db_name=%shared.config.name, count=futures.len(), "waiting for jobs");
+        info!(?db_name, count = futures.len(), "waiting for jobs");
 
         while futures.next().await.is_some() {}
     }
 
-    info!(db_name=%shared.config.name, "database worker finished");
+    info!(?db_name, "database worker finished");
 }
 
 /// Try to drive the database to `DatabaseState::Initialized` returns when
 /// this is achieved or the shutdown signal is triggered
 async fn initialize_database(shared: &DatabaseShared) {
-    let db_name = &shared.config.name;
-    info!(%db_name, "database initialization started");
+    let db_name = shared
+        .state
+        .read()
+        .provided_rules()
+        .map(|rules| rules.db_name().to_string());
+    info!(?db_name, "database initialization started");
 
     while !shared.shutdown.is_cancelled() {
         // Acquire locks and determine if work to be done
@@ -767,14 +781,14 @@ async fn initialize_database(shared: &DatabaseShared) {
                         Some(handle) => Some((DatabaseState::clone(&state), handle)),
                         None => {
                             // Backoff if there is already an in-progress initialization action (e.g. recovery)
-                            info!(%db_name, %state, "init transaction already in progress");
+                            info!(?db_name, %state, "init transaction already in progress");
                             None
                         }
                     }
                 }
                 // No active database found, was probably deleted
                 DatabaseState::NoActiveDatabase(_, _) => {
-                    info!(%db_name, "no active database found");
+                    info!(?db_name, "no active database found");
                     None
                 }
                 // Operator intervention required
@@ -783,7 +797,7 @@ async fn initialize_database(shared: &DatabaseShared) {
                 | DatabaseState::CatalogLoadError(_, e)
                 | DatabaseState::ReplayError(_, e) => {
                     error!(
-                        %db_name,
+                        ?db_name,
                         %e,
                         %state,
                         "database in error state - operator intervention required"
@@ -797,13 +811,13 @@ async fn initialize_database(shared: &DatabaseShared) {
         let (state, handle) = match maybe_transaction {
             Some((state, handle)) => (state, handle),
             None => {
-                info!(%db_name, "backing off initialization");
+                info!(?db_name, "backing off initialization");
                 tokio::time::sleep(INIT_BACKOFF).await;
                 continue;
             }
         };
 
-        info!(%db_name, %state, "attempting to advance database initialization state");
+        info!(?db_name, %state, "attempting to advance database initialization state");
 
         // Try to advance to the next state
         let next_state = match state {
@@ -832,7 +846,12 @@ async fn initialize_database(shared: &DatabaseShared) {
         // Commit the next state
         {
             let mut state = shared.state.write();
-            info!(%db_name, from=%state, to=%next_state, "database initialization state transition");
+            info!(
+                ?db_name,
+                from=%state,
+                to=%next_state,
+                "database initialization state transition"
+            );
 
             *state.unfreeze(handle) = next_state;
             shared.state_notify.notify_waiters();
@@ -855,11 +874,11 @@ pub enum InitError {
     NoActiveDatabase,
 
     #[snafu(display(
-        "Database names in deserialized rules ({}) does not match expected value ({})",
+        "Database UUID in deserialized rules ({}) does not match expected value ({})",
         actual,
         expected
     ))]
-    RulesDatabaseNameMismatch { actual: String, expected: String },
+    RulesDatabaseUuidMismatch { actual: Uuid, expected: Uuid },
 
     #[snafu(display("error loading catalog: {}", source))]
     CatalogLoad { source: crate::db::load::Error },
@@ -988,6 +1007,15 @@ impl DatabaseState {
         }
     }
 
+    /// Metrics for this database
+    fn metrics(&self) -> Option<&metrics::Metrics> {
+        // TODO
+        //         let metrics =
+        // metrics::Metrics::new(application.metric_registry().as_ref(), config.name.as_str());
+
+        unimplemented!()
+    }
+
     /// Whether the end user would want to know about this database or whether they would consider
     /// this database to be deleted
     fn is_active(&self) -> bool {
@@ -1014,7 +1042,7 @@ impl DatabaseStateKnown {
         let iox_object_store = IoxObjectStore::find_existing(
             Arc::clone(shared.application.object_store()),
             shared.config.server_id,
-            &shared.config.name,
+            shared.config.uuid,
         )
         .await
         .context(DatabaseObjectStoreLookup)?
@@ -1041,10 +1069,10 @@ impl DatabaseStateDatabaseObjectStoreFound {
             .await
             .context(LoadingRules)?;
 
-        if rules.db_name() != &shared.config.name {
-            return RulesDatabaseNameMismatch {
-                actual: rules.db_name(),
-                expected: shared.config.name.as_str(),
+        if rules.uuid() != shared.config.uuid {
+            return RulesDatabaseUuidMismatch {
+                actual: rules.uuid(),
+                expected: shared.config.uuid,
             }
             .fail();
         }
@@ -1068,8 +1096,9 @@ impl DatabaseStateRulesLoaded {
         &self,
         shared: &DatabaseShared,
     ) -> Result<DatabaseStateCatalogLoaded, InitError> {
+        let db_name = self.provided_rules.db_name();
         let (preserved_catalog, catalog, replay_plan) = load_or_create_preserved_catalog(
-            shared.config.name.as_str(),
+            db_name.as_str(),
             Arc::clone(&self.iox_object_store),
             Arc::clone(shared.application.metric_registry()),
             Arc::clone(shared.application.time_provider()),
@@ -1084,7 +1113,7 @@ impl DatabaseStateRulesLoaded {
         let producer = match rules.write_buffer_connection.as_ref() {
             Some(connection) if matches!(connection.direction, WriteBufferDirection::Write) => {
                 let producer = write_buffer_factory
-                    .new_config_write(shared.config.name.as_str(), connection)
+                    .new_config_write(db_name.as_str(), connection)
                     .await
                     .context(CreateWriteBuffer)?;
                 Some(producer)
@@ -1136,15 +1165,12 @@ impl DatabaseStateCatalogLoaded {
         db.unsuppress_persistence();
 
         let rules = self.provided_rules.rules();
+        let name = &self.provided_rules.rules().name;
         let write_buffer_factory = shared.application.write_buffer_factory();
         let write_buffer_consumer = match rules.write_buffer_connection.as_ref() {
             Some(connection) if matches!(connection.direction, WriteBufferDirection::Read) => {
                 let mut consumer = write_buffer_factory
-                    .new_config_read(
-                        shared.config.server_id,
-                        shared.config.name.as_str(),
-                        connection,
-                    )
+                    .new_config_read(shared.config.server_id, name.as_str(), connection)
                     .await
                     .context(CreateWriteBuffer)?;
 
@@ -1214,8 +1240,7 @@ mod tests {
         let database = Database::new(
             Arc::clone(&application),
             DatabaseConfig {
-                name: DatabaseName::new("test").unwrap(),
-                uuid: Some(Uuid::new_v4()),
+                uuid: Uuid::new_v4(),
                 server_id: ServerId::new(NonZeroU32::new(23).unwrap()),
                 wipe_catalog_on_error: false,
                 skip_replay: false,
@@ -1273,15 +1298,14 @@ mod tests {
 
         let db_name = DatabaseName::new("test").unwrap();
         let uuid = Uuid::new_v4();
-        let provided_rules = ProvidedDatabaseRules::new_empty(db_name.clone());
+        let provided_rules = ProvidedDatabaseRules::new_empty(db_name.clone(), uuid);
 
         Database::create(Arc::clone(&application), uuid, &provided_rules, server_id)
             .await
             .unwrap();
 
         let db_config = DatabaseConfig {
-            name: db_name,
-            uuid: Some(uuid),
+            uuid,
             server_id,
             wipe_catalog_on_error: false,
             skip_replay: false,
@@ -1343,7 +1367,7 @@ mod tests {
             InitError::NoActiveDatabase
         ));
 
-        database.restore(0).await.unwrap();
+        database.restore().await.unwrap();
 
         // Database should re-initialize correctly
         tokio::time::timeout(Duration::from_millis(1), database.wait_for_init())
@@ -1422,8 +1446,7 @@ mod tests {
         .await
         .unwrap();
         let db_config = DatabaseConfig {
-            name: db_name,
-            uuid: Some(uuid),
+            uuid,
             server_id,
             wipe_catalog_on_error: false,
             skip_replay: false,

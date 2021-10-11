@@ -18,6 +18,7 @@ use std::{
 };
 use structopt::StructOpt;
 use thiserror::Error;
+use uuid::Uuid;
 
 mod chunk;
 mod partition;
@@ -280,6 +281,10 @@ pub async fn command(connection: Connection, config: Config) -> Result<()> {
                 ]));
 
                 for database in databases {
+                    let uuid = Uuid::from_slice(&database.uuid)
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|_| String::from("<UUID parsing failed>"));
+
                     let deleted_at = database
                         .deleted_at
                         .and_then(|t| {
@@ -289,7 +294,7 @@ pub async fn command(connection: Connection, config: Config) -> Result<()> {
                         .unwrap_or_else(String::new);
                     table.add_row(Row::new(vec![
                         Cell::new(&deleted_at),
-                        Cell::new(&database.generation_id.to_string()),
+                        Cell::new(&uuid),
                         Cell::new(&database.db_name),
                     ]));
                 }

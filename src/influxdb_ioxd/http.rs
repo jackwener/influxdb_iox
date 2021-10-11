@@ -897,21 +897,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        convert::TryFrom,
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-    };
-
     use arrow::record_batch::RecordBatch;
     use arrow_util::assert_batches_eq;
-    use reqwest::{Client, Response};
-
     use data_types::{database_rules::DatabaseRules, server_id::ServerId, DatabaseName};
     use metric::{Attributes, DurationHistogram, Metric, U64Counter};
     use object_store::ObjectStore;
+    use reqwest::{Client, Response};
     use serde::de::DeserializeOwned;
     use server::{
         connection::ConnectionManagerImpl, db::Db, rules::ProvidedDatabaseRules, ApplicationState,
+    };
+    use std::{
+        convert::TryFrom,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
     };
     use tokio_stream::wrappers::ReceiverStream;
     use trace::RingBufferTraceCollector;

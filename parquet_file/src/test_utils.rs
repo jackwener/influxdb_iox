@@ -16,7 +16,6 @@ use data_types::{
     chunk_metadata::{ChunkAddr, ChunkId, ChunkOrder},
     partition_metadata::{ColumnSummary, InfluxDbType, StatValues, Statistics, TableSummary},
     server_id::ServerId,
-    DatabaseName,
 };
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_util::MemoryStream;
@@ -36,6 +35,7 @@ use schema::{builder::SchemaBuilder, Schema, TIME_COLUMN_NAME};
 use snafu::{ResultExt, Snafu};
 use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc};
 use time::Time;
+use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -856,12 +856,11 @@ pub fn make_server_id() -> ServerId {
 /// Creates new in-memory database iox_object_store for testing.
 pub async fn make_iox_object_store() -> Arc<IoxObjectStore> {
     let server_id = make_server_id();
-    let database_name = DatabaseName::new("db1").unwrap();
     Arc::new(
         IoxObjectStore::new(
             Arc::new(ObjectStore::new_in_memory()),
             server_id,
-            &database_name,
+            Uuid::new_v4(),
         )
         .await
         .unwrap(),

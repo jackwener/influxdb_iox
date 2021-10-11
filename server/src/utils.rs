@@ -15,6 +15,7 @@ use query::exec::ExecutorConfig;
 use query::{exec::Executor, QueryDatabase};
 use std::{borrow::Cow, convert::TryFrom, num::NonZeroU32, sync::Arc, time::Duration};
 use time::{Time, TimeProvider};
+use uuid::Uuid;
 use write_buffer::core::WriteBufferWriting;
 
 // A wrapper around a Db and a metric registry allowing for isolated testing
@@ -64,18 +65,20 @@ impl TestDbBuilder {
             .take()
             .unwrap_or_else(|| Arc::new(time::SystemProvider::new()));
 
+        let uuid = Uuid::new_v4();
+
         let object_store = self
             .object_store
             .unwrap_or_else(|| Arc::new(ObjectStore::new_in_memory()));
 
         let iox_object_store =
-            IoxObjectStore::find_existing(Arc::clone(&object_store), server_id, &db_name)
+            IoxObjectStore::find_existing(Arc::clone(&object_store), server_id, uuid)
                 .await
                 .unwrap();
 
         let iox_object_store = match iox_object_store {
             Some(ios) => ios,
-            None => IoxObjectStore::new(Arc::clone(&object_store), server_id, &db_name)
+            None => IoxObjectStore::new(Arc::clone(&object_store), server_id, uuid)
                 .await
                 .unwrap(),
         };

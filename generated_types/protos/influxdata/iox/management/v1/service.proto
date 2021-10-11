@@ -203,14 +203,17 @@ message ListDetailedDatabasesResponse {
 
 // This resource represents detailed information about a database.
 message DetailedDatabase {
-  // The generation ID of the database.
-  uint64 generation_id = 1;
+  // Was the generation ID of the database.
+  reserved 1;
 
   // The UTC datetime at which this database was deleted, if applicable.
   google.protobuf.Timestamp deleted_at = 2;
 
   // The name of the database.
   string db_name = 3;
+
+  // The UUID of the database.
+  bytes uuid = 4;
 }
 
 message ListChunksRequest {

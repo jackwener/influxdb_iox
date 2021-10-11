@@ -1273,6 +1273,7 @@ dependencies = [
  "time 0.1.0",
  "tonic",
  "tonic-build",
+ "uuid",
 ]
 
 [[package]]

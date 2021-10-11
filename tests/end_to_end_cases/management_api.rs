@@ -307,9 +307,7 @@ async fn test_list_databases() {
         .expect("list deleted databases failed");
 
     assert!(
-        deleted_databases
-            .iter()
-            .any(|db| db.db_name == name1 && db.generation_id == 0),
+        deleted_databases.iter().any(|db| db.db_name == name1),
         "could not find expected database in {:?}",
         deleted_databases
     );

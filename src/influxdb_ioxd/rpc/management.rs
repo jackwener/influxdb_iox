@@ -189,10 +189,9 @@ where
     ) -> Result<Response<RestoreDatabaseResponse>, Status> {
         let request = request.into_inner();
         let db_name = DatabaseName::new(request.db_name).field("db_name")?;
-        let generation_id = request.generation_id;
 
         self.server
-            .restore_database(&db_name, generation_id)
+            .restore_database(&db_name)
             .await
             .map_err(default_server_error_handler)?;
 
@@ -487,7 +486,10 @@ where
                 databases
                     .into_iter()
                     .map(|database| DatabaseStatus {
-                        db_name: database.config().name.to_string(),
+                        db_name: database
+                            .name()
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| String::from("Unknown")),
                         error: database.init_error().map(|e| ProtobufError {
                             message: e.to_string(),
                         }),

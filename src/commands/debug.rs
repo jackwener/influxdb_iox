@@ -1,11 +1,10 @@
-use data_types::DatabaseName;
+use crate::{object_store::ObjectStoreConfig, server_id::ServerIdConfig};
 use iox_object_store::IoxObjectStore;
 use object_store::ObjectStore;
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::{convert::TryFrom, sync::Arc};
 use structopt::StructOpt;
-
-use crate::{object_store::ObjectStoreConfig, server_id::ServerIdConfig};
+use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -17,10 +16,8 @@ pub enum Error {
     #[snafu(display("No server ID provided"))]
     NoServerId,
 
-    #[snafu(display("Invalid database name: {}", source))]
-    InvalidDbName {
-        source: data_types::DatabaseNameError,
-    },
+    #[snafu(display("Invalid database UUID: {}", source))]
+    InvalidDbUuid { source: uuid::Error },
 
     #[snafu(display("Cannot open IOx object store: {}", source))]
     IoxObjectStoreFailure {
@@ -62,8 +59,8 @@ struct DumpCatalog {
     #[structopt(flatten)]
     server_id_config: ServerIdConfig,
 
-    /// The name of the database
-    db_name: String,
+    /// The UUID of the database
+    db_uuid: String,
 
     // dump options
     #[structopt(flatten)]
@@ -120,14 +117,13 @@ pub async fn command(config: Config) -> Result<()> {
         Command::DumpCatalog(dump_catalog) => {
             let object_store = ObjectStore::try_from(&dump_catalog.object_store_config)
                 .context(ObjectStoreParsing)?;
-            let database_name =
-                DatabaseName::try_from(dump_catalog.db_name).context(InvalidDbName)?;
+            let database_uuid = Uuid::parse_str(&dump_catalog.db_uuid).context(InvalidDbUuid)?;
             let server_id = dump_catalog
                 .server_id_config
                 .server_id
                 .context(NoServerId)?;
             let iox_object_store =
-                IoxObjectStore::find_existing(Arc::new(object_store), server_id, &database_name)
+                IoxObjectStore::find_existing(Arc::new(object_store), server_id, database_uuid)
                     .await
                     .context(IoxObjectStoreFailure)?
                     .context(NoIoxObjectStore)?;

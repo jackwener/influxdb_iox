@@ -143,7 +143,7 @@ impl TestDbBuilder {
 
         TestDb {
             metric_registry,
-            db: Db::new(database_to_commit, jobs),
+            db: Arc::new(Db::new(database_to_commit, jobs)),
             replay_plan: replay_plan.expect("did not skip replay"),
         }
     }

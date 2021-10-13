@@ -646,3 +646,132 @@ async fn test_grouped_series_set_plan_group_aggregate_none() {
     )
     .await;
 }
+
+
+struct MeasurementForGroupByField {}
+#[async_trait]
+impl DbSetup for MeasurementForGroupByField {
+    async fn make(&self) -> Vec<DbScenario> {
+        let partition_key = "1970-01-01T00";
+
+        let lp_lines1 = vec![
+            "system,host=local,region=A load1=1.1,load2=2.1 100",
+            "system,host=local,region=A load1=1.2,load2=2.2 200",
+            "system,host=remote,region=B load1=10.1,load2=2.1 100",
+        ];
+
+        let lp_lines2 = vec![
+            "system,host=remote,region=B load1=10.2,load2=20.2 200",
+            "system,host=local,region=C load1=100.1,load2=200.1 100",
+        ];
+
+        make_two_chunk_scenarios(partition_key, &lp_lines1.join("\n"), &lp_lines2.join("\n")).await
+    }
+}
+
+
+
+#[tokio::test]
+async fn test_grouped_series_set_plan_group_by_field_none() {
+    // no predicate
+    let predicate = PredicateBuilder::default().build();
+
+    let agg = Aggregate::None;
+    let group_columns = vec!["_field"];
+
+    // Expect the data is grouped so all the distinct values of load1
+    // are before the values for load2
+    let expected_results = vec![
+        "TODO"
+    ];
+
+    run_read_group_test_case(
+        MeasurementForGroupByField {},
+        predicate,
+        agg,
+        group_columns,
+        expected_results,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_grouped_series_set_plan_group_by_field_and_tag_none() {
+    // no predicate
+    let predicate = PredicateBuilder::default().build();
+
+    let agg = Aggregate::None;
+    let group_columns = vec!["_field", "region"];
+
+    // Expect the data is grouped so all the distinct values of load1
+    // are before the values for load2, grouped by region
+    let expected_results = vec![
+        "TODO"
+    ];
+
+    run_read_group_test_case(
+        MeasurementForGroupByField {},
+        predicate,
+        agg,
+        group_columns,
+        expected_results,
+    )
+    .await;
+}
+
+
+#[tokio::test]
+async fn test_grouped_series_set_plan_group_by_tag_and_field_none() {
+    // no predicate
+    let predicate = PredicateBuilder::default().build();
+
+    let agg = Aggregate::None;
+    // note group by the tag first then the field.... Should the output order be the same??
+    let group_columns = vec!["region", "_field"];
+
+    // TODO verifify this result with tsm
+    let expected_results = vec![
+        "TODO"
+    ];
+
+    run_read_group_test_case(
+        MeasurementForGroupByField {},
+        predicate,
+        agg,
+        group_columns,
+        expected_results,
+    )
+    .await;
+}
+
+
+#[tokio::test]
+async fn test_grouped_series_set_plan_group_by_field_count() {
+    // no predicate
+    let predicate = PredicateBuilder::default().build();
+
+    let agg = Aggregate::Count;
+    let group_columns = vec!["_field"];
+
+    // Expect the data is grouped so all the distinct values of load1
+    // are before the values for for load2
+    let expected_results = vec![
+        "TODO"
+    ];
+
+    run_read_group_test_case(
+        MeasurementForGroupByField {},
+        predicate,
+        agg,
+        group_columns,
+        expected_results,
+    )
+    .await;
+}
+
+
+#[tokio::test]
+async fn test_grouped_series_set_plan_group_tag_field_tag_count() {
+    todo!("TODO: group by a tag, then _field, then tag")
+
+}

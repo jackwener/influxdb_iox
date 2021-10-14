@@ -21,6 +21,11 @@ use entry::Column as EntryColumn;
 use influxdb_line_protocol::FieldValue;
 use schema::{IOxValueType, InfluxColumnType, InfluxFieldType, TIME_DATA_TYPE};
 
+use generated_types::influxdata::pbdata::v1::{
+    column::{SemanticType, Values as PbValues},
+    Column as PbColumn,
+};
+
 /// A "dictionary ID" (DID) is a compact numeric representation of an interned
 /// string in the dictionary. The same string always maps the same DID.
 ///
@@ -555,6 +560,134 @@ impl Column {
         assert_eq!(data.len(), self.len());
 
         Ok(data)
+    }
+
+    pub(crate) fn append_pb(&mut self, row_count: usize, column: PbColumn) {
+        // TODO: Validate schema
+
+        let mut added = 0;
+        let valid_mask: Vec<_> = column.null_mask.into_iter().map(|x| !x).collect();
+
+        let values = column.values.unwrap();
+
+        match &mut self.data {
+            ColumnData::F64(col_data, stats) => {
+                handle_write(
+                    row_count,
+                    &valid_mask,
+                    values.f64_values.into_iter(),
+                    col_data,
+                    stats,
+                    None,
+                );
+            }
+            ColumnData::I64(col_data, stats) => {
+                handle_write(
+                    row_count,
+                    &valid_mask,
+                    values.i64_values.into_iter(),
+                    col_data,
+                    stats,
+                    None,
+                );
+            }
+            ColumnData::U64(col_data, stats) => {
+                handle_write(
+                    row_count,
+                    &valid_mask,
+                    values.u64_values.into_iter(),
+                    col_data,
+                    stats,
+                    None,
+                );
+            }
+            ColumnData::String(col_data, stats) => {
+                unimplemented!()
+            }
+            ColumnData::Bool(col_data, stats) => {
+                unimplemented!()
+            }
+            ColumnData::Tag(col_data, dictionary, stats) => {
+                let data_offset = col_data.len();
+                col_data.resize(data_offset + row_count, INVALID_DID);
+
+                let initial_total_count = stats.total_count;
+                let mut added = 0;
+
+                for (idx, value) in MaskedIter::new(
+                    iter_set_positions(&valid_mask),
+                    values.string_values.iter(),
+                    None,
+                ) {
+                    stats.update(value);
+                    col_data[data_offset + idx] = dictionary.lookup_value_or_insert(value);
+                    added += 1;
+                }
+
+                let null_count = row_count - added;
+                stats.update_for_nulls(null_count as u64);
+
+                assert_eq!(
+                    stats.total_count - initial_total_count - null_count as u64,
+                    added as u64
+                );
+            }
+        }
+
+        self.valid.append_bits(row_count, &valid_mask);
+    }
+
+    pub(crate) fn to_pb(&self, column_name: String) -> PbColumn {
+        let mut values = PbValues {
+            i64_values: vec![],
+            f64_values: vec![],
+            u64_values: vec![],
+            string_values: vec![],
+            bool_values: vec![],
+            bytes_values: vec![],
+        };
+
+        let iter = iter_set_positions(self.valid.bytes());
+        match &self.data {
+            ColumnData::F64(col_data, _) => {
+                values.f64_values = iter.map(|idx| col_data[idx]).collect()
+            }
+            ColumnData::I64(col_data, _) => {
+                values.i64_values = iter.map(|idx| col_data[idx]).collect()
+            }
+            ColumnData::U64(col_data, _) => {
+                values.u64_values = iter.map(|idx| col_data[idx]).collect()
+            }
+            ColumnData::String(col_data, _) => {
+                values.string_values = iter
+                    .map(|idx| col_data.get(idx).unwrap().to_string())
+                    .collect()
+            }
+            ColumnData::Bool(col_data, _) => {
+                values.bool_values = iter.map(|idx| col_data.get(idx)).collect()
+            }
+            ColumnData::Tag(col_data, dictionary, _) => {
+                values.string_values = iter
+                    .map(|idx| dictionary.lookup_id(col_data[idx]).unwrap().to_string())
+                    .collect()
+            }
+        };
+
+        PbColumn {
+            column_name,
+            semantic_type: influx_to_semantic_type(self.influx_type) as _,
+            values: Some(values),
+            null_mask: self.valid.bytes().iter().map(|x| !x).collect(),
+        }
+    }
+}
+
+fn influx_to_semantic_type(influx_type: InfluxColumnType) -> SemanticType {
+    match influx_type {
+        InfluxColumnType::IOx(_) => SemanticType::Iox,
+        InfluxColumnType::Tag => SemanticType::Tag,
+        InfluxColumnType::Field(_) => SemanticType::Field,
+        InfluxColumnType::Timestamp => SemanticType::Time,
     }
 }
 

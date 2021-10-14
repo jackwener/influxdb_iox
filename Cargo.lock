@@ -2209,8 +2209,10 @@ dependencies = [
  "data_types",
  "entry",
  "flate2",
+ "generated_types",
  "hashbrown 0.11.2",
  "influxdb_line_protocol",
+ "prost",
  "schema",
  "snafu",
 ]

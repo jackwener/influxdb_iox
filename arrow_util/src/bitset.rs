@@ -121,6 +121,11 @@ impl BitSet {
     pub fn byte_len(&self) -> usize {
         self.buffer.len()
     }
+
+    /// Returns the underlying packed bits representing this bitset
+    pub fn bytes(&self) -> &[u8] {
+        &self.buffer
+    }
 }
 
 /// Returns an iterator over set bit positions in increasing order

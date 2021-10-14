@@ -24,6 +24,11 @@ use schema::selection::Selection;
 use schema::{builder::SchemaBuilder, InfluxColumnType, InfluxFieldType, Schema, TIME_COLUMN_NAME};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 
+use generated_types::influxdata::pbdata::v1::{
+    column::{SemanticType, Values as PbValues},
+    Column as PbColumn, TableBatch as PbTableBatch,
+};
+
 pub mod column;
 
 #[allow(missing_docs)]
@@ -274,6 +279,40 @@ impl MutableBatch {
             .or_insert_with(|| (name.to_string(), Column::new(row_count, influx_type)))
             .1
     }
+
+    pub fn write_pb(&mut self, batch: PbTableBatch) -> Result<()> {
+        let to_add = batch.row_count;
+        let final_row_count = self.row_count + batch.row_count as usize;
+
+        // TODO: Schema validation
+
+        for col in batch.columns {
+            // TODO: error handling
+            let influx_type = pb_column_type(&col).unwrap();
+            let mut column = self.column_or_insert(col.column_name.as_str(), influx_type);
+            column.append_pb(to_add as usize, col)
+        }
+
+        for c in self.columns.values_mut() {
+            c.push_nulls_to_len(final_row_count);
+        }
+
+        self.row_count = final_row_count;
+
+        Ok(())
+    }
+
+    pub fn to_pb(&self, table_name: String) -> PbTableBatch {
+        PbTableBatch {
+            table_name,
+            columns: self
+                .columns
+                .iter()
+                .map(|(name, value)| value.to_pb(name.clone()))
+                .collect(),
+            row_count: self.row_count as u32,
+        }
+    }
 }
 
 fn field_value_type(value: &FieldValue<'_>) -> InfluxFieldType {
@@ -284,6 +323,37 @@ fn field_value_type(value: &FieldValue<'_>) -> InfluxFieldType {
         FieldValue::String(_) => InfluxFieldType::String,
         FieldValue::Boolean(_) => InfluxFieldType::Boolean,
     }
+}
+
+fn pb_column_type(col: &PbColumn) -> Option<InfluxColumnType> {
+    let value_type = pb_value_type(col.values.as_ref()?)?;
+    let semantic_type = SemanticType::from_i32(col.semantic_type)?;
+
+    match (semantic_type, value_type) {
+        (SemanticType::Tag, InfluxFieldType::String) => Some(InfluxColumnType::Tag),
+        (SemanticType::Field, field) => Some(InfluxColumnType::Field(field)),
+        (SemanticType::Time, InfluxFieldType::Integer) => Some(InfluxColumnType::Timestamp),
+        _ => None,
+    }
+}
+
+fn pb_value_type(values: &PbValues) -> Option<InfluxFieldType> {
+    if !values.string_values.is_empty() {
+        return Some(InfluxFieldType::String);
+    }
+    if !values.i64_values.is_empty() {
+        return Some(InfluxFieldType::Integer);
+    }
+    if !values.u64_values.is_empty() {
+        return Some(InfluxFieldType::UInteger);
+    }
+    if !values.f64_values.is_empty() {
+        return Some(InfluxFieldType::Float);
+    }
+    if !values.bool_values.is_empty() {
+        return Some(InfluxFieldType::Boolean);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -547,10 +617,9 @@ mod tests {
             b.write_line(maybe_line, 0).unwrap();
         }
 
-        assert_eq!(
-            a.schema(Selection::All).unwrap(),
-            b.schema(Selection::All).unwrap()
-        );
+        let a_schema = a.schema(Selection::All).unwrap();
+        let b_schema = b.schema(Selection::All).unwrap();
+        assert_eq!(a_schema, b_schema);
 
         let a_formatted =
             arrow_util::display::pretty_format_batches(&[a.to_arrow(Selection::All).unwrap()])
@@ -560,6 +629,20 @@ mod tests {
             arrow_util::display::pretty_format_batches(&[b.to_arrow(Selection::All).unwrap()])
                 .unwrap();
 
-        assert_eq!(a_formatted, b_formatted)
+        assert_eq!(a_formatted, b_formatted);
+
+        let pb = a.to_pb("my table".to_string());
+
+        let mut c = MutableBatch::new();
+
+        c.write_pb(pb).unwrap();
+
+        assert_eq!(c.schema(Selection::All).unwrap(), a_schema);
+
+        let c_formatted =
+            arrow_util::display::pretty_format_batches(&[c.to_arrow(Selection::All).unwrap()])
+                .unwrap();
+
+        assert_eq!(a_formatted, c_formatted);
     }
 }

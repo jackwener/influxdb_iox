@@ -1,5 +1,8 @@
 //! Query frontend for InfluxDB Storage gRPC requests
-use std::{cmp::Ordering, collections::{BTreeMap, BTreeSet}, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use arrow::datatypes::{DataType, Field};
 use data_types::chunk_metadata::ChunkId;
@@ -655,7 +658,7 @@ impl InfluxRpcPlanner {
         // group tables by chunk, pruning if possible
         let chunks = database.chunks(normalizer.unnormalized());
         let table_chunks = self.group_chunks_by_table(&mut normalizer, chunks)?;
-
+        let num_prefix_tag_group_columns = group_columns.len();
 
         // now, build up plans for each table
         let mut ss_plans = Vec::with_capacity(table_chunks.len());
@@ -671,22 +674,18 @@ impl InfluxRpcPlanner {
                     &mut normalizer,
                     chunks,
                 )?,
-                _ => {
-
-                    self.read_group_plan(
-                        table_name,
-                        schema,
-                        &mut normalizer,
-                        agg,
-                        group_columns,
-                        chunks,
-                    )?
-                },
+                _ => self.read_group_plan(
+                    table_name,
+                    schema,
+                    &mut normalizer,
+                    agg,
+                    group_columns,
+                    chunks,
+                )?,
             };
 
             // If we have to do real work, add it to the list of plans
             if let Some(ss_plan) = ss_plan {
-                let num_prefix_tag_group_columns = group_columns.len();
                 let grouped_plan = ss_plan.grouped(num_prefix_tag_group_columns);
                 ss_plans.push(grouped_plan);
             }
@@ -1058,7 +1057,8 @@ impl InfluxRpcPlanner {
         };
 
         // order the tag columns so that the group keys come first (we
-        // will group and order in the same order)
+        // will group and
+        // order in the same order)
         let tag_columns: Vec<_> = schema.tags_iter().map(|f| f.name() as &str).collect();
 
         // Group by all tag columns
@@ -1066,12 +1066,6 @@ impl InfluxRpcPlanner {
             .iter()
             .map(|tag_name| tag_name.as_expr())
             .collect::<Vec<_>>();
-
-        let tag_columns: Vec<Arc<str>> = reorder_prefix(group_columns, tag_columns)?
-            .into_iter()
-            .map(Arc::from)
-            .collect();
-
 
         let AggExprs {
             agg_exprs,
@@ -1638,57 +1632,6 @@ fn make_selector_expr(
     Ok(uda
         .call(vec![col(field_name), col(TIME_COLUMN_NAME)])
         .alias(column_name))
-}
-
-/// Describes how to "unpivot" IOx's relational schema back to
-/// timeseries
-#[derive(Debug, PartialEq)]
-enum GroupByUnpivot {
-    /// Unpivot all fields into individual timeseries, with one table
-    /// after the other
-    //
-    /// TagA | TagB | Field1 | Field2 | time
-    /// -----+------+--------+--------+-------
-    ///   a  |  b   |  1     | 2      | 100
-    ///   a  |  b   |  1     | 2      | 200
-    ///
-    /// Results in time series:
-    ///
-    /// {_field=Field1, TagA=a, TagB=b } ..
-    /// {_field=Field2, TagA=a, TagB=b } ..
-    MeasurementAndTags {table_name: String},
-
-    /// Unpivot using tags and only the specified field
-    //
-    /// TagA | TagB | Field1 | Field2 | time
-    /// -----+------+--------+--------+-------
-    ///   a  |  b   |  1     | 2      | 100
-    ///   a  |  b   |  1     | 2      | 200
-    ///
-    /// Given column_name=Field2, results in the single timeseries
-    ///
-    /// {_field=Field2, TagA=a, TagB=b } ..
-    MeasurementTagsAndField { table_name: String, column_name: String }
-}
-
-impl PartialOrd for GroupByUnpivot {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        match (self, other) {
-            (Self::MeasurementAndTags {..}, Self::MeasurementTagsAndField{..}) => {
-                Some(Ordering::Less)
-            }
-            (Self::MeasurementTagsAndField {..}, Self::MeasurementAndTags{..}) => {
-                Some(Ordering::Greater)
-            }
-            (Self::MeasurementAndTags {table_name: my_name}, Self::MeasurementAndTags {table_name: other_name}) => {
-                my_name.partial_cmp(other_name)
-            },
-            (Self::MeasurementTagsAndField {table_name: my_name, column_name: my_column},
-             Self::MeasurementTagsAndField {table_name: other_name, column_name: other_column}) => {
-                (my_name, my_column).partial_cmp(&(other_name, other_column))
-            }
-        }
-    }
 }
 
 /// Creates specialized / normalized predicates

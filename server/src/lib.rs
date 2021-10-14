@@ -97,6 +97,7 @@ use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::sync::Arc;
 use tokio::{sync::Notify, task::JoinError};
 use tokio_util::sync::CancellationToken;
+use trace::ctx::SpanContext;
 use tracker::{TaskTracker, TrackedFutureExt};
 use uuid::Uuid;
 
@@ -779,14 +780,18 @@ where
         .context(ListDetailedDatabases)?)
     }
 
-    pub async fn write_pb(&self, database_batch: pb::DatabaseBatch) -> Result<()> {
+    pub async fn write_pb(
+        &self,
+        database_batch: pb::DatabaseBatch,
+        span_ctx: Option<SpanContext>,
+    ) -> Result<()> {
         let db_name = DatabaseName::new(database_batch.database_name.as_str())
             .context(InvalidDatabaseName)?;
 
         let entry = pb_to_entry(&database_batch).context(PBConversion)?;
 
         // TODO: Apply routing/sharding logic (#2139)
-        self.write_entry_local(&db_name, entry).await?;
+        self.write_entry_local(&db_name, entry, span_ctx).await?;
 
         Ok(())
     }
@@ -805,6 +810,7 @@ where
         db_name: &DatabaseName<'_>,
         lines: &[ParsedLine<'_>],
         default_time: i64,
+        span_ctx: Option<SpanContext>,
     ) -> Result<()> {
         let db = self.db(db_name)?;
         let rules = db.rules();
@@ -833,10 +839,13 @@ where
 
                 match sink {
                     Some(sink) => {
-                        self.write_entry_sink(db_name, sink, sharded_entry.entry)
+                        self.write_entry_sink(db_name, sink, sharded_entry.entry, span_ctx.clone())
                             .await
                     }
-                    None => self.write_entry_local(db_name, sharded_entry.entry).await,
+                    None => {
+                        self.write_entry_local(db_name, sharded_entry.entry, span_ctx.clone())
+                            .await
+                    }
                 }
             },
         ))
@@ -849,6 +858,7 @@ where
         db_name: &DatabaseName<'_>,
         sink: &Sink,
         entry: Entry,
+        span_ctx: Option<SpanContext>,
     ) -> Result<()> {
         match sink {
             Sink::Iox(node_group) => {
@@ -859,7 +869,7 @@ where
                 // The write buffer write path is currently implemented in "db", so confusingly we
                 // need to invoke write_entry_local.
                 // TODO(mkm): tracked in #2134
-                self.write_entry_local(db_name, entry).await
+                self.write_entry_local(db_name, entry, span_ctx).await
             }
             Sink::DevNull => {
                 // write is silently ignored, as requested by the configuration.
@@ -913,11 +923,16 @@ where
     /// Write an entry to the local `Db`
     ///
     /// TODO: Remove this and migrate callers to `Database::write_entry`
-    pub async fn write_entry_local(&self, db_name: &DatabaseName<'_>, entry: Entry) -> Result<()> {
+    pub async fn write_entry_local(
+        &self,
+        db_name: &DatabaseName<'_>,
+        entry: Entry,
+        span_ctx: Option<SpanContext>,
+    ) -> Result<()> {
         use database::WriteError;
 
         self.active_database(db_name)?
-            .write_entry(entry)
+            .write_entry(entry, span_ctx)
             .await
             .map_err(|e| match e {
                 WriteError::NotInitialized { .. } => Error::DatabaseNotInitialized {
@@ -1315,6 +1330,7 @@ mod tests {
                 &DatabaseName::new("foo").unwrap(),
                 &lines,
                 ARBITRARY_DEFAULT_TIME,
+                None,
             )
             .await
             .unwrap_err();
@@ -1524,7 +1540,7 @@ mod tests {
         let line = "cpu bar=1 10";
         let lines: Vec<_> = parse_lines(line).map(|l| l.unwrap()).collect();
         server
-            .write_lines(&db_name, &lines, ARBITRARY_DEFAULT_TIME)
+            .write_lines(&db_name, &lines, ARBITRARY_DEFAULT_TIME, None)
             .await
             .unwrap();
 
@@ -1572,7 +1588,7 @@ mod tests {
 
         let entry = &sharded_entries[0].entry;
         server
-            .write_entry_local(&name, entry.clone())
+            .write_entry_local(&name, entry.clone(), None)
             .await
             .expect("write entry");
 
@@ -1663,7 +1679,7 @@ mod tests {
         let lines: Vec<_> = parse_lines(line).map(|l| l.unwrap()).collect();
 
         let err = server
-            .write_lines(&db_name, &lines, ARBITRARY_DEFAULT_TIME)
+            .write_lines(&db_name, &lines, ARBITRARY_DEFAULT_TIME, None)
             .await
             .unwrap_err();
         assert!(
@@ -1673,7 +1689,7 @@ mod tests {
         // one remote is configured but it's down and we'll get connection error
         server.update_remote(bad_remote_id, BAD_REMOTE_ADDR.into());
         let err = server
-            .write_lines(&db_name, &lines, ARBITRARY_DEFAULT_TIME)
+            .write_lines(&db_name, &lines, ARBITRARY_DEFAULT_TIME, None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1695,7 +1711,7 @@ mod tests {
         // probability both the remotes will get hit.
         for _ in 0..100 {
             server
-                .write_lines(&db_name, &lines, ARBITRARY_DEFAULT_TIME)
+                .write_lines(&db_name, &lines, ARBITRARY_DEFAULT_TIME, None)
                 .await
                 .expect("cannot write lines");
         }
@@ -1720,7 +1736,7 @@ mod tests {
         let line = "cpu bar=1 10";
         let lines: Vec<_> = parse_lines(line).map(|l| l.unwrap()).collect();
         server
-            .write_lines(&db_name, &lines, ARBITRARY_DEFAULT_TIME)
+            .write_lines(&db_name, &lines, ARBITRARY_DEFAULT_TIME, None)
             .await
             .unwrap();
 
@@ -1821,7 +1837,7 @@ mod tests {
 
         let entry_1 = &sharded_entries_1[0].entry;
         server
-            .write_entry_local(&name, entry_1.clone())
+            .write_entry_local(&name, entry_1.clone(), None)
             .await
             .expect("write first entry");
 
@@ -1836,7 +1852,7 @@ mod tests {
         )
         .expect("second sharded entries");
         let entry_2 = &sharded_entries_2[0].entry;
-        let res = server.write_entry_local(&name, entry_2.clone()).await;
+        let res = server.write_entry_local(&name, entry_2.clone(), None).await;
         assert!(matches!(res, Err(super::Error::HardLimitReached {})));
     }
 
@@ -1957,12 +1973,12 @@ mod tests {
         // can only write to successfully created DBs
         let lines = parsed_lines("cpu foo=1 10");
         server
-            .write_lines(&foo_db_name, &lines, ARBITRARY_DEFAULT_TIME)
+            .write_lines(&foo_db_name, &lines, ARBITRARY_DEFAULT_TIME, None)
             .await
             .unwrap();
 
         let err = server
-            .write_lines(&bar_db_name, &lines, ARBITRARY_DEFAULT_TIME)
+            .write_lines(&bar_db_name, &lines, ARBITRARY_DEFAULT_TIME, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::DatabaseNotInitialized { .. }));
@@ -2373,7 +2389,12 @@ mod tests {
         let line = "cpu bar=1 10";
         let lines: Vec<_> = parse_lines(line).map(|l| l.unwrap()).collect();
         server
-            .write_lines(&db_name_catalog_broken, &lines, ARBITRARY_DEFAULT_TIME)
+            .write_lines(
+                &db_name_catalog_broken,
+                &lines,
+                ARBITRARY_DEFAULT_TIME,
+                None,
+            )
             .await
             .expect("DB writable");
 
@@ -2468,7 +2489,7 @@ mod tests {
 
         let entry = lp_to_entry("cpu bar=1 10");
 
-        let res = server.write_entry_local(&db_name, entry).await;
+        let res = server.write_entry_local(&db_name, entry, None).await;
         assert!(
             matches!(res, Err(Error::WriteBuffer { .. })),
             "Expected Err(Error::WriteBuffer {{ .. }}), got: {:?}",

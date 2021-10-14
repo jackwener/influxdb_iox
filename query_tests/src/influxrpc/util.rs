@@ -1,51 +1,5 @@
-use std::sync::Arc;
-
-use arrow_util::display::pretty_format_batches;
 use query::exec::IOxExecutionContext;
-use query::{
-    exec::{
-        field::FieldIndexes,
-        seriesset::{SeriesSet, SeriesSetItem},
-    },
-    plan::seriesset::SeriesSetPlans,
-};
-
-/// Format the field indexes into strings
-pub fn dump_field_indexes(f: FieldIndexes) -> Vec<String> {
-    f.as_slice()
-        .iter()
-        .map(|field_index| {
-            format!(
-                "  (value_index: {}, timestamp_index: {})",
-                field_index.value_index, field_index.timestamp_index
-            )
-        })
-        .collect()
-}
-
-/// Format a the vec of Arc strings paris into strings
-pub fn dump_arc_vec(v: Vec<(Arc<str>, Arc<str>)>) -> Vec<String> {
-    v.into_iter()
-        .map(|(k, v)| format!("  ({}, {})", k, v))
-        .collect()
-}
-
-/// Format a series set into a format that is easy to compare in tests
-pub fn dump_series_set(s: SeriesSet) -> Vec<String> {
-    let mut f = vec!["SeriesSet".into()];
-    f.push(format!("table_name: {}", s.table_name));
-    f.push("tags".to_string());
-    f.extend(dump_arc_vec(s.tags).into_iter());
-    f.push("field_indexes:".to_string());
-    f.extend(dump_field_indexes(s.field_indexes).into_iter());
-    f.push(format!("start_row: {}", s.start_row));
-    f.push(format!("num_rows: {}", s.num_rows));
-    f.push("Batches:".into());
-    let formatted_batch = pretty_format_batches(&[s.batch]).unwrap();
-    f.extend(formatted_batch.trim().split('\n').map(|s| s.to_string()));
-
-    f
-}
+use query::{exec::seriesset::SeriesSetItem, plan::seriesset::SeriesSetPlans};
 
 /// Run a series set plan to completion and produce a Vec<String> representation
 ///
@@ -81,7 +35,14 @@ pub async fn run_series_set_plan(ctx: &IOxExecutionContext, plans: SeriesSetPlan
 
     results
         .into_iter()
-        .map(|s| dump_series_set(s).into_iter())
+        .map(|s| {
+            s.to_string()
+                .trim()
+                .split('\n')
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
         .flatten()
         .collect::<Vec<_>>()
 }

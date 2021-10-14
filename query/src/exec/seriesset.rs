@@ -23,9 +23,8 @@ pub mod converter;
 pub mod series;
 
 use arrow::{self, record_batch::RecordBatch};
-use arrow_util::display::pretty_format_batches;
 
-use std::{fmt, sync::Arc};
+use std::sync::Arc;
 
 use super::field::FieldIndexes;
 
@@ -57,50 +56,6 @@ pub struct SeriesSet {
 
     // The underlying record batch data
     pub batch: RecordBatch,
-}
-
-impl fmt::Display for SeriesSet {
-    /// Formats a SeriesSet in way that is similar to how it is
-    /// returned to flux (individual series, one for each field)
-    ///
-    /// This is intended to be used for testing / debugging
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "SeriesSet")?;
-        writeln!(f, "table_name: {}", self.table_name)?;
-        writeln!(f, "tags")?;
-
-        fmt_arc_vec(f, &self.tags)?;
-
-        writeln!(f, "field_indexes:")?;
-        fmt_field_indexes(f, &self.field_indexes)?;
-        writeln!(f, "start_row: {}", self.start_row)?;
-        writeln!(f, "num_rows: {}", self.num_rows)?;
-        writeln!(f, "Batches:")?;
-
-        let formatted_batch = pretty_format_batches(&[self.batch.clone()])
-            .unwrap_or_else(|e| format!("<ERROR PRINTING BATCH: {}>", e));
-
-        writeln!(f, "{}", formatted_batch)?;
-
-        Ok(())
-    }
-}
-
-/// Format the field indexes into strings
-fn fmt_field_indexes(f: &mut fmt::Formatter<'_>, fi: &FieldIndexes) -> fmt::Result {
-    fi.iter().try_for_each(|field_index| {
-        writeln!(
-            f,
-            "  (value_index: {}, timestamp_index: {})",
-            field_index.value_index, field_index.timestamp_index
-        )
-    })
-}
-
-/// Format a the vec of Arc strings paris into strings
-fn fmt_arc_vec(f: &mut fmt::Formatter<'_>, v: &[(Arc<str>, Arc<str>)]) -> fmt::Result {
-    v.iter()
-        .try_for_each(|(k, v)| writeln!(f, "  ({}, {})", k, v))
 }
 
 /// Describes a group of series "group of series" series. Namely,

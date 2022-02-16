@@ -114,7 +114,7 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -265,18 +265,20 @@ pub struct FileBufferStreamHandler {
     sequencer_id: u32,
     path: PathBuf,
     next_sequence_number: Arc<AtomicU64>,
+    terminated: Arc<AtomicBool>,
     trace_collector: Option<Arc<dyn TraceCollector>>,
 }
 
 #[async_trait]
 impl WriteBufferStreamHandler for FileBufferStreamHandler {
-    fn stream(&mut self) -> BoxStream<'_, Result<DmlOperation, WriteBufferError>> {
+    async fn stream(&mut self) -> BoxStream<'_, Result<DmlOperation, WriteBufferError>> {
         let committed = self.path.join("committed");
 
         ConsumerStream::new(
             self.sequencer_id,
             committed,
             Arc::clone(&self.next_sequence_number),
+            Arc::clone(&self.terminated),
             self.trace_collector.clone(),
         )
         .boxed()
@@ -285,6 +287,7 @@ impl WriteBufferStreamHandler for FileBufferStreamHandler {
     async fn seek(&mut self, sequence_number: u64) -> Result<(), WriteBufferError> {
         self.next_sequence_number
             .store(sequence_number, Ordering::SeqCst);
+        self.terminated.store(false, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -339,6 +342,7 @@ impl WriteBufferReading for FileBufferConsumer {
             sequencer_id,
             path: path.clone(),
             next_sequence_number: Arc::new(AtomicU64::new(0)),
+            terminated: Arc::new(AtomicBool::new(false)),
             trace_collector: self.trace_collector.clone(),
         }))
     }
@@ -362,10 +366,11 @@ impl WriteBufferReading for FileBufferConsumer {
 
 #[pin_project]
 struct ConsumerStream {
-    fut: ReusableBoxFuture<Result<DmlOperation, WriteBufferError>>,
+    fut: ReusableBoxFuture<'static, Option<Result<DmlOperation, WriteBufferError>>>,
     sequencer_id: u32,
     path: PathBuf,
     next_sequence_number: Arc<AtomicU64>,
+    terminated: Arc<AtomicBool>,
     trace_collector: Option<Arc<dyn TraceCollector>>,
 }
 
@@ -374,6 +379,7 @@ impl ConsumerStream {
         sequencer_id: u32,
         path: PathBuf,
         next_sequence_number: Arc<AtomicU64>,
+        terminated: Arc<AtomicBool>,
         trace_collector: Option<Arc<dyn TraceCollector>>,
     ) -> Self {
         Self {
@@ -381,11 +387,13 @@ impl ConsumerStream {
                 sequencer_id,
                 path.clone(),
                 Arc::clone(&next_sequence_number),
+                Arc::clone(&terminated),
                 trace_collector.clone(),
             )),
             sequencer_id,
             path,
             next_sequence_number,
+            terminated,
             trace_collector,
         }
     }
@@ -394,10 +402,15 @@ impl ConsumerStream {
         sequencer_id: u32,
         path: PathBuf,
         next_sequence_number: Arc<AtomicU64>,
+        terminated: Arc<AtomicBool>,
         trace_collector: Option<Arc<dyn TraceCollector>>,
-    ) -> Result<DmlOperation, WriteBufferError> {
+    ) -> Option<Result<DmlOperation, WriteBufferError>> {
         loop {
             let sequence_number = next_sequence_number.load(Ordering::SeqCst);
+
+            if terminated.load(Ordering::SeqCst) {
+                return None;
+            }
 
             // read file
             let file_path = path.join(sequence_number.to_string());
@@ -453,6 +466,11 @@ impl ConsumerStream {
                                             .ok();
                                         continue;
                                     }
+                                } else if sequence_number > watermark {
+                                    terminated.store(true, Ordering::SeqCst);
+                                    return Some(Err(WriteBufferError::unknown_sequence_number(
+                                        format!("unknown sequence number, high watermark is {watermark}"),
+                                    )));
                                 }
                             };
 
@@ -468,7 +486,7 @@ impl ConsumerStream {
                 }
             };
 
-            return msg;
+            return Some(msg);
         }
     }
 
@@ -537,9 +555,10 @@ impl Stream for ConsumerStream {
                     *this.sequencer_id,
                     this.path.clone(),
                     Arc::clone(this.next_sequence_number),
+                    Arc::clone(this.terminated),
                     this.trace_collector.clone(),
                 ));
-                std::task::Poll::Ready(Some(res))
+                std::task::Poll::Ready(res)
             }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
@@ -809,7 +828,7 @@ mod tests {
 
         let reader = ctx.reading(true).await.unwrap();
         let mut handler = reader.stream_handler(sequencer_id).await.unwrap();
-        let mut stream = handler.stream();
+        let mut stream = handler.stream().await;
 
         assert_write_op_eq(&stream.next().await.unwrap().unwrap(), &w1);
         assert_write_op_eq(&stream.next().await.unwrap().unwrap(), &w4);
@@ -838,7 +857,7 @@ mod tests {
 
         let reader = ctx.reading(true).await.unwrap();
         let mut handler = reader.stream_handler(sequencer_id).await.unwrap();
-        let mut stream = handler.stream();
+        let mut stream = handler.stream().await;
 
         assert_write_op_eq(&stream.next().await.unwrap().unwrap(), &w2);
     }

@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
 };
@@ -10,10 +10,11 @@ use async_trait::async_trait;
 use data_types::{sequence::Sequence, write_buffer::WriteBufferCreationConfig};
 use dml::{DmlMeta, DmlOperation};
 use futures::{stream::BoxStream, StreamExt};
+use parking_lot::Mutex;
 use rskafka::client::{
     consumer::StreamConsumerBuilder,
     error::{Error as RSKafkaError, ProtocolError},
-    partition::PartitionClient,
+    partition::{OffsetAt, PartitionClient},
     producer::{BatchProducer, BatchProducerBuilder},
     ClientBuilder,
 };
@@ -22,7 +23,10 @@ use trace::TraceCollector;
 
 use crate::{
     codec::IoxHeaders,
-    core::{WriteBufferError, WriteBufferReading, WriteBufferStreamHandler, WriteBufferWriting},
+    core::{
+        WriteBufferError, WriteBufferErrorKind, WriteBufferReading, WriteBufferStreamHandler,
+        WriteBufferWriting,
+    },
 };
 
 use self::{
@@ -118,7 +122,8 @@ impl WriteBufferWriting for RSKafkaProducer {
 #[derive(Debug)]
 pub struct RSKafkaStreamHandler {
     partition_client: Arc<PartitionClient>,
-    next_offset: Arc<AtomicI64>,
+    next_offset: Arc<Mutex<Option<i64>>>,
+    terminated: Arc<AtomicBool>,
     trace_collector: Option<Arc<dyn TraceCollector>>,
     consumer_config: ConsumerConfig,
     sequencer_id: u32,
@@ -126,14 +131,32 @@ pub struct RSKafkaStreamHandler {
 
 #[async_trait]
 impl WriteBufferStreamHandler for RSKafkaStreamHandler {
-    fn stream(&mut self) -> BoxStream<'_, Result<DmlOperation, WriteBufferError>> {
+    async fn stream(&mut self) -> BoxStream<'_, Result<DmlOperation, WriteBufferError>> {
+        if self.terminated.load(Ordering::SeqCst) {
+            return futures::stream::empty().boxed();
+        }
+
         let trace_collector = self.trace_collector.clone();
         let next_offset = Arc::clone(&self.next_offset);
+        let terminated = Arc::clone(&self.terminated);
 
-        let mut stream_builder = StreamConsumerBuilder::new(
-            Arc::clone(&self.partition_client),
-            next_offset.load(Ordering::SeqCst),
-        );
+        let start_offset: Option<i64> = {
+            // need to trick a bit to make this async function `Send`
+            *next_offset.lock()
+        };
+        let start_offset = match start_offset {
+            Some(x) => x,
+            None => {
+                // try to guess next offset from upstream
+                self.partition_client
+                    .get_offset(OffsetAt::Earliest)
+                    .await
+                    .unwrap_or_default()
+            }
+        };
+
+        let mut stream_builder =
+            StreamConsumerBuilder::new(Arc::clone(&self.partition_client), start_offset);
         if let Some(max_wait_ms) = self.consumer_config.max_wait_ms {
             stream_builder = stream_builder.with_max_wait_ms(max_wait_ms);
         }
@@ -146,10 +169,22 @@ impl WriteBufferStreamHandler for RSKafkaStreamHandler {
         let stream = stream_builder.build();
 
         let stream = stream.map(move |res| {
-            let (record, _watermark) = res?;
+            let (record, _watermark) = match res {
+                Ok(x) => x,
+                Err(e) => {
+                    terminated.store(true, Ordering::SeqCst);
+                    let kind = match e {
+                        RSKafkaError::ServerError(ProtocolError::OffsetOutOfRange, _) => {
+                            WriteBufferErrorKind::UnknownSequenceNumber
+                        }
+                        _ => WriteBufferErrorKind::Unknown,
+                    };
+                    return Err(WriteBufferError::new(kind, e));
+                }
+            };
 
             // store new offset already so we don't get stuck on invalid records
-            next_offset.store(record.offset + 1, Ordering::SeqCst);
+            *next_offset.lock() = Some(record.offset + 1);
 
             let kafka_read_size = record.record.approximate_size();
 
@@ -188,7 +223,8 @@ impl WriteBufferStreamHandler for RSKafkaStreamHandler {
 
     async fn seek(&mut self, sequence_number: u64) -> Result<(), WriteBufferError> {
         let offset = i64::try_from(sequence_number).map_err(WriteBufferError::invalid_input)?;
-        self.next_offset.store(offset, Ordering::SeqCst);
+        *self.next_offset.lock() = Some(offset);
+        self.terminated.store(false, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -248,7 +284,8 @@ impl WriteBufferReading for RSKafkaConsumer {
 
         Ok(Box::new(RSKafkaStreamHandler {
             partition_client: Arc::clone(partition_client),
-            next_offset: Arc::new(AtomicI64::new(0)),
+            next_offset: Arc::new(Mutex::new(None)),
+            terminated: Arc::new(AtomicBool::new(false)),
             trace_collector: self.trace_collector.clone(),
             consumer_config: self.consumer_config.clone(),
             sequencer_id,
@@ -263,7 +300,7 @@ impl WriteBufferReading for RSKafkaConsumer {
                 format!("Unknown partition: {}", sequencer_id).into()
             })?;
 
-        let watermark = partition_client.get_high_watermark().await?;
+        let watermark = partition_client.get_offset(OffsetAt::Latest).await?;
         u64::try_from(watermark).map_err(WriteBufferError::invalid_data)
     }
 
@@ -506,13 +543,13 @@ mod tests {
         let mut handler = consumer.stream_handler(sequencer_id).await.unwrap();
 
         // read broken message from stream
-        let mut stream = handler.stream();
+        let mut stream = handler.stream().await;
         let err = stream.next().await.unwrap().unwrap_err();
         assert_contains!(err.to_string(), "No content type header");
 
         // re-creating the stream should advance past the broken message
         drop(stream);
-        let mut stream = handler.stream();
+        let mut stream = handler.stream().await;
         let op = stream.next().await.unwrap().unwrap();
         assert_write_op_eq(&op, &w);
     }
@@ -558,7 +595,7 @@ mod tests {
 
         let consumer = ctx.reading(true).await.unwrap();
         let mut handler = consumer.stream_handler(sequencer_id).await.unwrap();
-        let mut stream = handler.stream();
+        let mut stream = handler.stream().await;
 
         // get output, note that the write operations were fused
         let op_w1_12 = stream.next().await.unwrap().unwrap();

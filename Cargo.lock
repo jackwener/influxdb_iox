@@ -459,9 +459,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.0.72"
+version = "1.0.73"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22a9137b95ea06864e018375b72adfb7db6e6f68cfc8df5a04d00288050485ee"
+checksum = "2fff2a6927b3bb87f9595d67196a70493f627687a71d87a0d692242c33f58c11"
 dependencies = [
  "jobserver",
 ]
@@ -1889,6 +1889,7 @@ dependencies = [
  "logfmt",
  "metric",
  "metric_exporters",
+ "mutable_batch",
  "mutable_batch_lp",
  "mutable_batch_pb",
  "mutable_buffer",
@@ -2046,6 +2047,7 @@ dependencies = [
  "parking_lot 0.12.0",
  "parquet",
  "parquet_file",
+ "pin-project",
  "predicate",
  "prost",
  "query",
@@ -2117,10 +2119,12 @@ dependencies = [
  "observability_deps",
  "paste",
  "pretty_assertions",
+ "rand",
  "schema",
  "snafu",
  "sqlx",
  "sqlx-hotswap-pool",
+ "tempfile",
  "test_helpers",
  "tokio",
  "uuid",
@@ -2313,9 +2317,9 @@ dependencies = [
 
 [[package]]
 name = "kube"
-version = "0.69.0"
+version = "0.69.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f06ab5c1d0d0bffbc96240728792fbe0f50139cf1320c285c8dc8eb0b4a09da"
+checksum = "86835e9147615457c1edc2b11c723acd1d21372e9cefa80a9d2742f6d69042d0"
 dependencies = [
  "k8s-openapi",
  "kube-client",
@@ -2392,9 +2396,9 @@ dependencies = [
 
 [[package]]
 name = "kube-runtime"
-version = "0.69.0"
+version = "0.69.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc3a141c952b29f5ef3a1f0ec397dcf1a473be55f162bceac9ebec046c524330"
+checksum = "32e8bf2258850dbc0a062b561656a1d7020fa8040d552e149f0a0361f0d6794e"
 dependencies = [
  "ahash",
  "backoff",
@@ -2492,9 +2496,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.117"
+version = "0.2.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e74d72e0f9b65b5b4ca49a346af3976df0f9c61d550727f349ecd559f251a26c"
+checksum = "1bf2e165bb3457c8e098ea76f3e3bc9db55f87aa90d52d0e6be741470916aaa4"
 
 [[package]]
 name = "libloading"
@@ -3232,7 +3236,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87f5ec2493a61ac0506c0f4199f99070cbe83857b0337006a30f3e6719b8ef58"
 dependencies = [
  "lock_api",
- "parking_lot_core 0.9.0",
+ "parking_lot_core 0.9.1",
 ]
 
 [[package]]
@@ -3251,15 +3255,15 @@ dependencies = [
 
 [[package]]
 name = "parking_lot_core"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2f4f894f3865f6c0e02810fc597300f34dc2510f66400da262d8ae10e75767d"
+checksum = "28141e0cc4143da2443301914478dc976a61ffdb3f043058310c70df2fed8954"
 dependencies = [
  "cfg-if",
  "libc",
  "redox_syscall",
  "smallvec",
- "windows-sys 0.29.0",
+ "windows-sys 0.32.0",
 ]
 
 [[package]]
@@ -4138,7 +4142,9 @@ dependencies = [
  "generated_types",
  "hashbrown 0.12.0",
  "hyper",
+ "influxdb_line_protocol",
  "iox_catalog",
+ "lazy_static",
  "metric",
  "mutable_batch",
  "mutable_batch_lp",
@@ -4146,6 +4152,7 @@ dependencies = [
  "parking_lot 0.12.0",
  "paste",
  "predicate",
+ "pretty_assertions",
  "rand",
  "schema",
  "serde",
@@ -4162,8 +4169,8 @@ dependencies = [
 
 [[package]]
 name = "rskafka"
-version = "0.1.0"
-source = "git+https://github.com/influxdata/rskafka.git?rev=7c74d43f50c517c9cbdb912dc5169066330f2528#7c74d43f50c517c9cbdb912dc5169066330f2528"
+version = "0.2.0"
+source = "git+https://github.com/influxdata/rskafka.git?rev=3af1939fd47f8680d40074dc3fd2e2a4a0da6b8c#3af1939fd47f8680d40074dc3fd2e2a4a0da6b8c"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4817,9 +4824,9 @@ dependencies = [
 
 [[package]]
 name = "sqlx-core"
-version = "0.5.10"
+version = "0.5.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "518be6f6fff5ca76f985d434f9c37f3662af279642acf730388f271dff7b9016"
+checksum = "195183bf6ff8328bb82c0511a83faf60aacf75840103388851db61d7a9854ae3"
 dependencies = [
  "ahash",
  "atoi",
@@ -4828,9 +4835,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "crc",
- "crossbeam-channel",
  "crossbeam-queue",
- "crossbeam-utils",
  "dirs",
  "either",
  "futures-channel",
@@ -4847,7 +4852,7 @@ dependencies = [
  "md-5",
  "memchr",
  "once_cell",
- "parking_lot 0.11.2",
+ "paste",
  "percent-encoding",
  "rand",
  "serde",
@@ -4901,9 +4906,9 @@ dependencies = [
 
 [[package]]
 name = "sqlx-rt"
-version = "0.5.10"
+version = "0.5.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8061cbaa91ee75041514f67a09398c65a64efed72c90151ecd47593bad53da99"
+checksum = "b555e70fbbf84e269ec3858b7a6515bcfe7a166a7cc9c636dd6efd20431678b6"
 dependencies = [
  "native-tls",
  "once_cell",
@@ -5913,19 +5918,6 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-sys"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ceb069ac8b2117d36924190469735767f0990833935ab430155e71a44bafe148"
-dependencies = [
- "windows_aarch64_msvc 0.29.0",
- "windows_i686_gnu 0.29.0",
- "windows_i686_msvc 0.29.0",
- "windows_x86_64_gnu 0.29.0",
- "windows_x86_64_msvc 0.29.0",
-]
-
-[[package]]
-name = "windows-sys"
 version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "030b7ff91626e57a05ca64a07c481973cbb2db774e4852c9c7ca342408c6a99a"
@@ -5938,10 +5930,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows_aarch64_msvc"
-version = "0.29.0"
+name = "windows-sys"
+version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d027175d00b01e0cbeb97d6ab6ebe03b12330a35786cbaca5252b1c4bf5d9b"
+checksum = "3df6e476185f92a12c072be4a189a0210dcdcf512a1891d6dff9edb874deadc6"
+dependencies = [
+ "windows_aarch64_msvc 0.32.0",
+ "windows_i686_gnu 0.32.0",
+ "windows_i686_msvc 0.32.0",
+ "windows_x86_64_gnu 0.32.0",
+ "windows_x86_64_msvc 0.32.0",
+]
 
 [[package]]
 name = "windows_aarch64_msvc"
@@ -5950,10 +5949,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29277a4435d642f775f63c7d1faeb927adba532886ce0287bd985bffb16b6bca"
 
 [[package]]
-name = "windows_i686_gnu"
-version = "0.29.0"
+name = "windows_aarch64_msvc"
+version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8793f59f7b8e8b01eda1a652b2697d87b93097198ae85f823b969ca5b89bba58"
+checksum = "d8e92753b1c443191654ec532f14c199742964a061be25d77d7a96f09db20bf5"
 
 [[package]]
 name = "windows_i686_gnu"
@@ -5962,10 +5961,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1145e1989da93956c68d1864f32fb97c8f561a8f89a5125f6a2b7ea75524e4b8"
 
 [[package]]
-name = "windows_i686_msvc"
-version = "0.29.0"
+name = "windows_i686_gnu"
+version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8602f6c418b67024be2996c512f5f995de3ba417f4c75af68401ab8756796ae4"
+checksum = "6a711c68811799e017b6038e0922cb27a5e2f43a2ddb609fe0b6f3eeda9de615"
 
 [[package]]
 name = "windows_i686_msvc"
@@ -5974,10 +5973,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4a09e3a0d4753b73019db171c1339cd4362c8c44baf1bcea336235e955954a6"
 
 [[package]]
-name = "windows_x86_64_gnu"
-version = "0.29.0"
+name = "windows_i686_msvc"
+version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3d615f419543e0bd7d2b3323af0d86ff19cbc4f816e6453f36a2c2ce889c354"
+checksum = "146c11bb1a02615db74680b32a68e2d61f553cc24c4eb5b4ca10311740e44172"
 
 [[package]]
 name = "windows_x86_64_gnu"
@@ -5986,16 +5985,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ca64fcb0220d58db4c119e050e7af03c69e6f4f415ef69ec1773d9aab422d5a"
 
 [[package]]
-name = "windows_x86_64_msvc"
-version = "0.29.0"
+name = "windows_x86_64_gnu"
+version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11d95421d9ed3672c280884da53201a5c46b7b2765ca6faf34b0d71cf34a3561"
+checksum = "c912b12f7454c6620635bbff3450962753834be2a594819bd5e945af18ec64bc"
 
 [[package]]
 name = "windows_x86_64_msvc"
 version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08cabc9f0066848fef4bc6a1c1668e6efce38b661d2aeec75d18d8617eebb5f1"
+
+[[package]]
+name = "windows_x86_64_msvc"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "504a2476202769977a040c6364301a3f65d0cc9e3fb08600b2bda150a0488316"
 
 [[package]]
 name = "winreg"

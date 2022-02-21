@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use observability_deps::tracing::{info, warn};
 use sqlx::{migrate::Migrator, postgres::PgPoolOptions, Acquire, Executor, Postgres, Row};
 use sqlx_hotswap_pool::HotSwapPool;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
 const MAX_CONNECTIONS: u32 = 5;
@@ -20,6 +20,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(500);
 /// the default schema name to use in Postgres
 pub const SCHEMA_NAME: &str = "iox_catalog";
+
+/// The file pointed to by a `dsn-file://` DSN is polled for change every `HOTSWAP_POLL_INTERVAL`.
+const HOTSWAP_POLL_INTERVAL: std::time::Duration = Duration::from_secs(5);
 
 static MIGRATOR: Migrator = sqlx::migrate!();
 
@@ -37,38 +40,10 @@ struct Count {
 
 impl PostgresCatalog {
     /// Connect to the catalog store.
-    pub async fn connect(
-        app_name: &'static str,
-        schema_name: &'static str,
-        dsn: &str,
-    ) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .min_connections(1)
-            .max_connections(MAX_CONNECTIONS)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .idle_timeout(IDLE_TIMEOUT)
-            .test_before_acquire(true)
-            .after_connect(move |c| {
-                Box::pin(async move {
-                    // Tag the connection with the provided application name.
-                    c.execute(sqlx::query("SET application_name = '$1';").bind(app_name))
-                        .await?;
-                    let search_path_query = format!("SET search_path TO public,{}", schema_name);
-                    c.execute(sqlx::query(&search_path_query)).await?;
-
-                    Ok(())
-                })
-            })
-            .connect(dsn)
+    pub async fn connect(app_name: &str, schema_name: &str, dsn: &str) -> Result<Self> {
+        let pool = new_pool(app_name, schema_name, dsn, HOTSWAP_POLL_INTERVAL)
             .await
             .map_err(|e| Error::SqlxError { source: e })?;
-
-        // Log a connection was successfully established and include the application
-        // name for cross-correlation between Conductor logs & database connections.
-        info!(application_name=%app_name, "connected to catalog store");
-
-        // Upgrade the pool to a hot swap pool
-        let pool = HotSwapPool::new(pool);
 
         Ok(Self { pool })
     }
@@ -240,6 +215,143 @@ impl Catalog for PostgresCatalog {
             inner: PostgresTxnInner::Oneshot(self.pool.clone()),
         })
     }
+}
+
+/// Creates a new [`sqlx::Pool`] from a database config and an explicit DSN.
+///
+/// This function doesn't support the IDPE specific `dsn-file://` uri scheme.
+async fn new_raw_pool(
+    app_name: &str,
+    schema_name: &str,
+    dsn: &str,
+) -> Result<sqlx::Pool<Postgres>, sqlx::Error> {
+    let app_name = app_name.to_owned();
+    let app_name2 = app_name.clone(); // just to log below
+    let schema_name = schema_name.to_owned();
+    let pool = PgPoolOptions::new()
+        .min_connections(1)
+        .max_connections(MAX_CONNECTIONS)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .idle_timeout(IDLE_TIMEOUT)
+        .test_before_acquire(true)
+        .after_connect(move |c| {
+            let app_name = app_name.to_owned();
+            let schema_name = schema_name.to_owned();
+            Box::pin(async move {
+                // Tag the connection with the provided application name, while allowing it to
+                // be overriden from the connection string (aka DSN).
+                // If current_application_name is empty here it means the application name wasn't
+                // set as part of the DSN, and we can set it explictly.
+                // Recall that this block is running on connection, not when creating the pool!
+                let current_application_name: String =
+                    sqlx::query_scalar("SELECT current_setting('application_name')")
+                        .fetch_one(&mut *c)
+                        .await?;
+                if current_application_name.is_empty() {
+                    sqlx::query("SELECT set_config('application_name', $1, false)")
+                        .bind(&*app_name)
+                        .execute(&mut *c)
+                        .await?;
+                }
+                let search_path_query = format!("SET search_path TO {}", schema_name);
+                c.execute(sqlx::query(&search_path_query)).await?;
+                Ok(())
+            })
+        })
+        .connect(dsn)
+        .await?;
+
+    // Log a connection was successfully established and include the application
+    // name for cross-correlation between Conductor logs & database connections.
+    info!(application_name=%app_name2, "connected to config store");
+
+    Ok(pool)
+}
+
+/// Creates a new HotSwapPool
+///
+/// This function understands the IDPE specific `dsn-file://` dsn uri scheme
+/// and hot swaps the pool with a new sqlx::Pool when the file changes.
+/// This is useful because the credentials can be rotated by infrastructure
+/// agents while the service is running.
+///
+/// The file is polled for changes every `polling_interval`.
+///
+/// The pool is replaced only once the new pool is successfully created.
+/// The [`new_raw_pool`] function will return a new pool only if the connection
+/// is successfull (see [`sqlx::pool::PoolOptions::test_before_acquire`]).
+async fn new_pool(
+    app_name: &str,
+    schema_name: &str,
+    dsn: &str,
+    polling_interval: Duration,
+) -> Result<HotSwapPool<Postgres>, sqlx::Error> {
+    let app_name: Arc<str> = Arc::from(app_name);
+    let schema_name: Arc<str> = Arc::from(schema_name);
+    let parsed_dsn = match get_dsn_file_path(dsn) {
+        Some(filename) => std::fs::read_to_string(&filename)?,
+        None => dsn.to_owned(),
+    };
+    let pool = HotSwapPool::new(new_raw_pool(&app_name, &schema_name, &parsed_dsn).await?);
+
+    if let Some(dsn_file) = get_dsn_file_path(dsn) {
+        let pool = pool.clone();
+
+        // TODO(mkm): return a guard that stops this background worker.
+        // We create only one pool per process, but it would be cleaner to be
+        // able to properly destroy the pool. If we don't kill this worker we
+        // effectively keep the pool alive (since it holds a reference to the
+        // Pool) and we also potentially pollute the logs with spurious warnings
+        // if the dsn file disappears (this may be annoying if they show up in the test
+        // logs).
+        tokio::spawn(async move {
+            let mut current_dsn = parsed_dsn.clone();
+            loop {
+                tokio::time::sleep(polling_interval).await;
+
+                async fn try_update(
+                    app_name: &str,
+                    schema_name: &str,
+                    current_dsn: &str,
+                    dsn_file: &str,
+                    pool: &HotSwapPool<Postgres>,
+                ) -> Result<Option<String>, sqlx::Error> {
+                    let new_dsn = std::fs::read_to_string(&dsn_file)?;
+                    if new_dsn == current_dsn {
+                        Ok(None)
+                    } else {
+                        let new_pool = new_raw_pool(app_name, schema_name, &new_dsn).await?;
+                        pool.replace(new_pool);
+                        Ok(Some(new_dsn))
+                    }
+                }
+
+                match try_update(&app_name, &schema_name, &current_dsn, &dsn_file, &pool).await {
+                    Ok(None) => {}
+                    Ok(Some(new_dsn)) => {
+                        info!("replaced hotswap pool");
+                        current_dsn = new_dsn;
+                    }
+                    Err(e) => {
+                        warn!(error=%e, filename=%dsn_file, "not replacing hotswap pool because of an error connecting to the new DSN");
+                    }
+                }
+            }
+        });
+    }
+
+    Ok(pool)
+}
+
+// Parses a `dsn-file://` scheme, according to the rules of the IDPE kit/sql package.
+//
+// If the dsn matches the `dsn-file://` prefix, the prefix is removed and the rest is interpreted
+// as a file name, in which case this function will return `Some(filename)`.
+// Otherwise it will return None. No URI decoding is performed on the filename.
+fn get_dsn_file_path(dsn: &str) -> Option<String> {
+    const DSN_SCHEME: &str = "dsn-file://";
+    dsn.starts_with(DSN_SCHEME)
+        .then(|| dsn[DSN_SCHEME.len()..].to_owned())
 }
 
 #[async_trait]
@@ -580,7 +692,7 @@ impl PartitionRepo for PostgresTxn {
         sequencer_id: SequencerId,
         table_id: TableId,
     ) -> Result<Partition> {
-        sqlx::query_as::<_, Partition>(
+        let v = sqlx::query_as::<_, Partition>(
             r#"
         INSERT INTO partition
             ( partition_key, sequencer_id, table_id )
@@ -601,7 +713,18 @@ impl PartitionRepo for PostgresTxn {
             } else {
                 Error::SqlxError { source: e }
             }
-        })
+        })?;
+
+        // If the partition_key_unique constraint was hit because there was an
+        // existing record for (table_id, partition_key) ensure the partition
+        // key in the DB is mapped to the same sequencer_id the caller
+        // requested.
+        assert_eq!(
+            v.sequencer_id, sequencer_id,
+            "attempted to overwrite partition with different sequencer ID"
+        );
+
+        Ok(v)
     }
 
     async fn list_by_sequencer(&mut self, sequencer_id: SequencerId) -> Result<Vec<Partition>> {
@@ -658,7 +781,7 @@ impl TombstoneRepo for PostgresTxn {
         max_time: Timestamp,
         predicate: &str,
     ) -> Result<Tombstone> {
-        sqlx::query_as::<_, Tombstone>(
+        let v = sqlx::query_as::<_, Tombstone>(
             r#"
         INSERT INTO tombstone
             ( table_id, sequencer_id, sequence_number, min_time, max_time, serialized_predicate )
@@ -682,7 +805,28 @@ impl TombstoneRepo for PostgresTxn {
             } else {
                 Error::SqlxError { source: e }
             }
-        })
+        })?;
+
+        // If tombstone_unique is hit, a record with (table_id, sequencer_id,
+        // sequence_number) already exists.
+        //
+        // Ensure the caller does not falsely believe they have created the
+        // record with the provided values if the DB row contains different
+        // values.
+        assert_eq!(
+            v.min_time, min_time,
+            "attempted to overwrite min_time in tombstone record"
+        );
+        assert_eq!(
+            v.max_time, max_time,
+            "attempted to overwrite max_time in tombstone record"
+        );
+        assert_eq!(
+            v.serialized_predicate, predicate,
+            "attempted to overwrite predicate in tombstone record"
+        );
+
+        Ok(v)
     }
 
     async fn list_tombstones_by_sequencer_greater_than(
@@ -884,9 +1028,15 @@ fn is_fk_violation(e: &sqlx::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::create_or_get_default_records;
+
     use super::*;
-    use std::env;
-    use std::sync::Arc;
+
+    use rand::Rng;
+    use std::{env, ops::DerefMut, sync::Arc};
+    use std::{io::Write, time::Instant};
+
+    use tempfile::NamedTempFile;
 
     // Helper macro to skip tests if TEST_INTEGRATION and the AWS environment variables are not set.
     macro_rules! maybe_skip_integration {
@@ -926,10 +1076,45 @@ mod tests {
     }
 
     async fn setup_db() -> PostgresCatalog {
+        // create a random schema for this particular pool
+        let schema_name = {
+            // use scope to make it clear to clippy / rust that `rng` is
+            // not carried past await points
+            let mut rng = rand::thread_rng();
+            (&mut rng)
+                .sample_iter(rand::distributions::Alphanumeric)
+                .filter(|c| c.is_ascii_alphabetic())
+                .take(20)
+                .map(char::from)
+                .collect::<String>()
+        };
+
         let dsn = std::env::var("DATABASE_URL").unwrap();
-        PostgresCatalog::connect("test", SCHEMA_NAME, &dsn)
+        let pg = PostgresCatalog::connect("test", &schema_name, &dsn)
             .await
-            .unwrap()
+            .expect("failed to connect catalog");
+
+        // Create the test schema
+        pg.pool
+            .execute(format!("CREATE SCHEMA {};", schema_name).as_str())
+            .await
+            .expect("failed to create test schema");
+
+        // Ensure the test user has permission to interact with the test schema.
+        pg.pool
+            .execute(
+                format!(
+                    "GRANT USAGE ON SCHEMA {} TO public; GRANT CREATE ON SCHEMA {} TO public;",
+                    schema_name, schema_name
+                )
+                .as_str(),
+            )
+            .await
+            .expect("failed to grant privileges to schema");
+
+        // Run the migrations against this random schema.
+        pg.setup().await.expect("failed to initialise database");
+        pg
     }
 
     #[tokio::test]
@@ -940,45 +1125,370 @@ mod tests {
         maybe_skip_integration!();
 
         let postgres = setup_db().await;
-        postgres.setup().await.unwrap();
-        clear_schema(&postgres.pool).await;
         let postgres: Arc<dyn Catalog> = Arc::new(postgres);
 
         crate::interface::test_helpers::test_catalog(postgres).await;
     }
 
-    async fn clear_schema(pool: &HotSwapPool<Postgres>) {
-        sqlx::query("delete from processed_tombstone;")
-            .execute(pool)
+    #[tokio::test]
+    async fn test_tombstone_create_or_get_idempotent() {
+        // If running an integration test on your laptop, this requires that you have Postgres
+        // running and that you've done the sqlx migrations. See the README in this crate for
+        // info to set it up.
+        maybe_skip_integration!();
+
+        let postgres = setup_db().await;
+        let postgres: Arc<dyn Catalog> = Arc::new(postgres);
+
+        let mut txn = postgres.start_transaction().await.expect("txn start");
+        let (kafka, query, sequencers) = create_or_get_default_records(1, txn.deref_mut())
             .await
-            .unwrap();
-        sqlx::query("delete from tombstone;")
-            .execute(pool)
+            .expect("db init failed");
+        txn.commit().await.expect("txn commit");
+
+        let namespace_id = postgres
+            .repositories()
             .await
-            .unwrap();
-        sqlx::query("delete from parquet_file;")
-            .execute(pool)
+            .namespaces()
+            .create("ns", crate::INFINITE_RETENTION_POLICY, kafka.id, query.id)
             .await
-            .unwrap();
-        sqlx::query("delete from column_name;")
-            .execute(pool)
+            .expect("namespace create failed")
+            .id;
+        let table_id = postgres
+            .repositories()
             .await
-            .unwrap();
-        sqlx::query("delete from partition;")
-            .execute(pool)
+            .tables()
+            .create_or_get("table", namespace_id)
             .await
-            .unwrap();
-        sqlx::query("delete from table_name;")
-            .execute(pool)
+            .expect("create table failed")
+            .id;
+
+        let sequencer_id = *sequencers.keys().next().expect("no sequencer");
+        let sequence_number = SequenceNumber::new(3);
+        let min_timestamp = Timestamp::new(10);
+        let max_timestamp = Timestamp::new(100);
+        let predicate = "bananas";
+
+        let a = postgres
+            .repositories()
             .await
-            .unwrap();
-        sqlx::query("delete from namespace;")
-            .execute(pool)
+            .tombstones()
+            .create_or_get(
+                table_id,
+                sequencer_id,
+                sequence_number,
+                min_timestamp,
+                max_timestamp,
+                predicate,
+            )
             .await
-            .unwrap();
-        sqlx::query("delete from sequencer;")
-            .execute(pool)
+            .expect("should create OK");
+
+        // Call create_or_get for the same (table_id, sequencer_id,
+        // sequence_number) triplet, setting the same metadata to ensure the
+        // write is idempotent.
+        let b = postgres
+            .repositories()
             .await
-            .unwrap();
+            .tombstones()
+            .create_or_get(
+                table_id,
+                sequencer_id,
+                sequence_number,
+                min_timestamp,
+                max_timestamp,
+                predicate,
+            )
+            .await
+            .expect("idempotent write should succeed");
+
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    #[should_panic = "attempted to overwrite predicate"]
+    async fn test_tombstone_create_or_get_no_overwrite() {
+        // If running an integration test on your laptop, this requires that you have Postgres
+        // running and that you've done the sqlx migrations. See the README in this crate for
+        // info to set it up.
+        maybe_skip_integration!();
+
+        let postgres = setup_db().await;
+        let postgres: Arc<dyn Catalog> = Arc::new(postgres);
+
+        let mut txn = postgres.start_transaction().await.expect("txn start");
+        let (kafka, query, sequencers) = create_or_get_default_records(1, txn.deref_mut())
+            .await
+            .expect("db init failed");
+        txn.commit().await.expect("txn commit");
+
+        let namespace_id = postgres
+            .repositories()
+            .await
+            .namespaces()
+            .create("ns2", crate::INFINITE_RETENTION_POLICY, kafka.id, query.id)
+            .await
+            .expect("namespace create failed")
+            .id;
+        let table_id = postgres
+            .repositories()
+            .await
+            .tables()
+            .create_or_get("table2", namespace_id)
+            .await
+            .expect("create table failed")
+            .id;
+
+        let sequencer_id = *sequencers.keys().next().expect("no sequencer");
+        let sequence_number = SequenceNumber::new(3);
+        let min_timestamp = Timestamp::new(10);
+        let max_timestamp = Timestamp::new(100);
+
+        let a = postgres
+            .repositories()
+            .await
+            .tombstones()
+            .create_or_get(
+                table_id,
+                sequencer_id,
+                sequence_number,
+                min_timestamp,
+                max_timestamp,
+                "bananas",
+            )
+            .await
+            .expect("should create OK");
+
+        // Call create_or_get for the same (table_id, sequencer_id,
+        // sequence_number) triplet with different metadata.
+        //
+        // The caller should not falsely believe it has persisted the incorrect
+        // predicate.
+        let b = postgres
+            .repositories()
+            .await
+            .tombstones()
+            .create_or_get(
+                table_id,
+                sequencer_id,
+                sequence_number,
+                min_timestamp,
+                max_timestamp,
+                "some other serialised predicate which is different",
+            )
+            .await
+            .expect("should panic before result evaluated");
+
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn test_partition_create_or_get_idempotent() {
+        // If running an integration test on your laptop, this requires that you have Postgres
+        // running and that you've done the sqlx migrations. See the README in this crate for
+        // info to set it up.
+        maybe_skip_integration!();
+
+        let postgres = setup_db().await;
+
+        let postgres: Arc<dyn Catalog> = Arc::new(postgres);
+        let mut txn = postgres.start_transaction().await.expect("txn start");
+        let (kafka, query, sequencers) = create_or_get_default_records(1, txn.deref_mut())
+            .await
+            .expect("db init failed");
+        txn.commit().await.expect("txn commit");
+
+        let namespace_id = postgres
+            .repositories()
+            .await
+            .namespaces()
+            .create("ns4", crate::INFINITE_RETENTION_POLICY, kafka.id, query.id)
+            .await
+            .expect("namespace create failed")
+            .id;
+        let table_id = postgres
+            .repositories()
+            .await
+            .tables()
+            .create_or_get("table", namespace_id)
+            .await
+            .expect("create table failed")
+            .id;
+
+        let key = "bananas";
+        let sequencer_id = *sequencers.keys().next().expect("no sequencer");
+
+        let a = postgres
+            .repositories()
+            .await
+            .partitions()
+            .create_or_get(key, sequencer_id, table_id)
+            .await
+            .expect("should create OK");
+
+        // Call create_or_get for the same (key, table_id, sequencer_id)
+        // triplet, setting the same sequencer ID to ensure the write is
+        // idempotent.
+        let b = postgres
+            .repositories()
+            .await
+            .partitions()
+            .create_or_get(key, sequencer_id, table_id)
+            .await
+            .expect("idempotent write should succeed");
+
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    #[should_panic = "attempted to overwrite partition"]
+    async fn test_partition_create_or_get_no_overwrite() {
+        // If running an integration test on your laptop, this requires that you have Postgres
+        // running and that you've done the sqlx migrations. See the README in this crate for
+        // info to set it up.
+        maybe_skip_integration!();
+
+        let postgres = setup_db().await;
+
+        let postgres: Arc<dyn Catalog> = Arc::new(postgres);
+        let mut txn = postgres.start_transaction().await.expect("txn start");
+        let (kafka, query, _) = create_or_get_default_records(2, txn.deref_mut())
+            .await
+            .expect("db init failed");
+        txn.commit().await.expect("txn commit");
+
+        let namespace_id = postgres
+            .repositories()
+            .await
+            .namespaces()
+            .create("ns3", crate::INFINITE_RETENTION_POLICY, kafka.id, query.id)
+            .await
+            .expect("namespace create failed")
+            .id;
+        let table_id = postgres
+            .repositories()
+            .await
+            .tables()
+            .create_or_get("table", namespace_id)
+            .await
+            .expect("create table failed")
+            .id;
+
+        let key = "bananas";
+
+        let sequencers = postgres
+            .repositories()
+            .await
+            .sequencers()
+            .list()
+            .await
+            .expect("failed to list sequencers");
+        assert!(
+            sequencers.len() > 1,
+            "expected more sequencers to be created, got {}",
+            sequencers.len()
+        );
+
+        let a = postgres
+            .repositories()
+            .await
+            .partitions()
+            .create_or_get(key, sequencers[0].id, table_id)
+            .await
+            .expect("should create OK");
+
+        // Call create_or_get for the same (key, table_id) tuple, setting a
+        // different sequencer ID
+        let b = postgres
+            .repositories()
+            .await
+            .partitions()
+            .create_or_get(key, sequencers[1].id, table_id)
+            .await
+            .expect("result should not be evaluated");
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_parse_dsn_file() {
+        assert_eq!(
+            get_dsn_file_path("dsn-file:///tmp/my foo.txt"),
+            Some("/tmp/my foo.txt".to_owned()),
+        );
+        assert_eq!(get_dsn_file_path("dsn-file:blah"), None,);
+        assert_eq!(get_dsn_file_path("postgres://user:pw@host/db"), None,);
+    }
+
+    #[tokio::test]
+    async fn test_reload() {
+        maybe_skip_integration!();
+
+        const POLLING_INTERVAL: Duration = Duration::from_millis(10);
+
+        // fetch dsn from envvar
+        let test_dsn = std::env::var("DATABASE_URL").unwrap();
+        eprintln!("TEST_DSN={}", test_dsn);
+
+        // create a temp file to store the initial dsn
+        let mut dsn_file = NamedTempFile::new().expect("create temp file");
+        dsn_file
+            .write_all(test_dsn.as_bytes())
+            .expect("write temp file");
+
+        const TEST_APPLICATION_NAME: &str = "test_application_name";
+        let dsn_good = format!("dsn-file://{}", dsn_file.path().display());
+        eprintln!("dsn_good={}", dsn_good);
+
+        // create a hot swap pool with test application name and dsn file pointing to tmp file.
+        // we will later update this file and the pool should be replaced.
+        let pool = new_pool(
+            TEST_APPLICATION_NAME,
+            "test",
+            dsn_good.as_str(),
+            POLLING_INTERVAL,
+        )
+        .await
+        .expect("connect");
+        eprintln!("got a pool");
+
+        // ensure the application name is set as expected
+        let application_name: String =
+            sqlx::query_scalar("SELECT current_setting('application_name') as application_name;")
+                .fetch_one(&pool)
+                .await
+                .expect("read application_name");
+        assert_eq!(application_name, TEST_APPLICATION_NAME);
+
+        // create a new temp file object with updated dsn and overwrite the previous tmp file
+        const TEST_APPLICATION_NAME_NEW: &str = "changed_application_name";
+        let mut new_dsn_file = NamedTempFile::new().expect("create temp file");
+        new_dsn_file
+            .write_all(test_dsn.as_bytes())
+            .expect("write temp file");
+        new_dsn_file
+            .write_all(format!("?application_name={}", TEST_APPLICATION_NAME_NEW).as_bytes())
+            .expect("write temp file");
+        new_dsn_file
+            .persist(dsn_file.path())
+            .expect("overwrite new dsn file");
+
+        // wait until the hotswap machinery has reloaded the updated DSN file and
+        // successfully performed a new connection with the new DSN.
+        let mut application_name = "".to_string();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5)
+            && application_name != TEST_APPLICATION_NAME_NEW
+        {
+            tokio::time::sleep(POLLING_INTERVAL).await;
+
+            application_name = sqlx::query_scalar(
+                "SELECT current_setting('application_name') as application_name;",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read application_name");
+        }
+        assert_eq!(application_name, TEST_APPLICATION_NAME_NEW);
     }
 }
